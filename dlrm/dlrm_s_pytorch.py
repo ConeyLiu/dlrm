@@ -55,13 +55,12 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # miscellaneous
 import builtins
-import functools
 # import bisect
 # import shutil
 import time
 import json
 # data generation
-import dlrm_data_pytorch as dp
+from dlrm import dlrm_data_pytorch as dp, extend_distributed as ext_dist, mlperf_logger
 
 # numpy
 import numpy as np
@@ -82,18 +81,16 @@ from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.scatter_gather import gather, scatter
 
 # For distributed run
-import extend_distributed as ext_dist
 
 import intel_pytorch_extension as ipex
 from intel_pytorch_extension import core
 
 # quotient-remainder trick
-from tricks.qr_embedding_bag import QREmbeddingBag
+from dlrm.tricks.qr_embedding_bag import QREmbeddingBag
 # mixed-dimension trick
-from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
+from dlrm.tricks.md_embedding_bag import PrEmbeddingBag, md_solver
 
 import sklearn.metrics
-import mlperf_logger
 
 # from torchviz import make_dot
 # import torch.nn.functional as Functional

@@ -45,8 +45,8 @@ from sklearn.metrics import recall_score
 
 from sklearn import manifold
 
-import dlrm_data_pytorch as dp
-from dlrm_s_pytorch import DLRM_Net
+from dlrm import dlrm_data_pytorch as dp
+from dlrm.dlrm_s_pytorch import DLRM_Net
 
 
 def visualize_embeddings_umap(emb_l,

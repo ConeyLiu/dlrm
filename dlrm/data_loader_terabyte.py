@@ -14,7 +14,7 @@ import time
 import math
 from tqdm import tqdm
 import argparse
-import extend_distributed as ext_dist
+from dlrm import extend_distributed as ext_dist
 
 
 class DataLoader:
@@ -333,7 +333,7 @@ def _test_bin():
     dataset_binary = CriteoBinDataset(data_file=binary_data_file,
                                             counts_file=counts_file,
                                             batch_size=2048,)
-    from dlrm_data_pytorch import CriteoDataset, collate_wrapper_criteo
+    from dlrm.dlrm_data_pytorch import CriteoDataset, collate_wrapper_criteo
 
     binary_loader = torch.utils.data.DataLoader(
         dataset_binary,

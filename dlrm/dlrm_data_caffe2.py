@@ -19,11 +19,10 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # others
 # from os import path
-import sys
 import bisect
 import collections
 
-import data_utils
+from dlrm import data_utils
 
 # numpy
 import numpy as np

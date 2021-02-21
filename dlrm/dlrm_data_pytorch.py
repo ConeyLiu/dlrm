@@ -23,7 +23,7 @@ from os import path
 import bisect
 import collections
 
-import data_utils
+from dlrm import data_utils, data_loader_terabyte, mlperf_logger
 
 # numpy
 import numpy as np
@@ -33,9 +33,6 @@ from numpy import random as ra
 # pytorch
 import torch
 from torch.utils.data import Dataset, RandomSampler
-
-import data_loader_terabyte
-import mlperf_logger
 
 
 # Kaggle Display Advertising Challenge Dataset
