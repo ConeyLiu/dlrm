@@ -106,7 +106,7 @@ def init_distributed(rank = -1, size = -1, backend=''):
             y = list(y.split([r for r in range(my_size)]))
             dist.all_gather(y, x)
             allgatherv_supported = True
-        except RuntimeError:
+        except Exception:
             pass
     else:
         my_rank = 0
