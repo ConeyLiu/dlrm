@@ -18,7 +18,6 @@ from torch.utils.data.dataset import IterableDataset
 
 import dlrm.extend_distributed as ext_dist
 import dlrm.mlperf_logger as mlperf_logger
-from dlrm.dlrm_s_pytorch import DLRM_Net, LRPolicyScheduler
 # quotient-remainder trick
 # mixed-dimension trick
 from dlrm.tricks.md_embedding_bag import md_solver
@@ -144,6 +143,7 @@ class Executor:
             return loss_sc_.mean()
 
     def create_model(self, ln_emb):
+        from dlrm.dlrm_s_pytorch import DLRM_Net, LRPolicyScheduler
         args = self.args
         # some basic setup
         np.random.seed(args.numpy_rand_seed)
