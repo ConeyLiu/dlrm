@@ -75,7 +75,7 @@ class Executor:
         fn = functools.partial(collate_fn,
                                num_numerical_features=self.args.arch_dense_feature_size,
                                max_ind_range=self.args.max_ind_range,
-                               flag_input_torch_tensor=True)
+                               flag_input_torch_tensor=False)
         train_loader = torch.utils.data.DataLoader(
             train_ds,
             batch_size=None,
