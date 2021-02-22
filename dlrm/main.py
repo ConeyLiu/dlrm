@@ -66,8 +66,8 @@ class Executor:
         self.world_rank = world_rank
         os.environ["RANK"] = str(world_rank)
         os.environ["WORLD_SIZE"] = str(self.world_size)
-        os.environ["MASTER_ADDR"] = master_addr
-        os.environ["MASTER_PORT"] = master_port
+        os.environ["MASTER_ADDR"] = str(master_addr)
+        os.environ["MASTER_PORT"] = str(master_port)
 
         ext_dist.init_distributed(world_rank, self.world_size, "gloo")
 
