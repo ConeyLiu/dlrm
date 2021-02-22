@@ -939,64 +939,115 @@ class TorchDataset(IterableDataset):
             yield return_df
 
 
-def dlrm_run(num_workers: int,
-             multiple_for_mlds: int,
-             cores_per_worker: int,
-             inter_op_parallelism: int,
-             intra_op_parallelism: int,
-             args: DLRMRunArguments):
+class ExecutorCluster:
+    def __init__(self,
+                 num_workers: int,
+                 multiple_for_ml_ds: int,
+                 cores_per_worker: int,
+                 inter_op_parallelism: int,
+                 intra_op_parallelism: int,
+                 args: DLRMRunArguments):
+        assert cores_per_worker == (inter_op_parallelism * intra_op_parallelism)
+        assert ray.is_initialized()
 
-    assert cores_per_worker == (inter_op_parallelism * intra_op_parallelism)
+        self.num_workers = num_workers
+        self.multiple_for_ml_ds = multiple_for_ml_ds
+        self.cores_per_worker = cores_per_worker
+        self.inter_op_parallelism = inter_op_parallelism
+        self.intra_op_parallelism = intra_op_parallelism
+        self.args = args
 
-    assert ray.is_initialized()
+        self.train_folder = None
+        self.test_folder = None
+        self.model_size = None
 
-    try:
-        # start up spark cluster
-        spark = raydp.init_spark(app_name=args.spark_app_name,
-                                 num_executors=args.spark_num_executors,
-                                 executor_cores=args.spark_executor_cores,
-                                 executor_memory=args.spark_executor_memory,
-                                 configs=args.spark_extra_config)
-        # preprocessing
-        train_folder, test_folder, model_size = pre_process(spark, args.pre_proc_args)
-    except:
-        raise
-    finally:
-        raydp.stop_spark()
+        self.executors = []
 
-    train_ds = ml_data.read_parquet(train_folder, num_workers * multiple_for_mlds)
-    # test_ds = ml_data.read_parquet(train_folder, num_workers * multiple_for_mlds)
+    def data_process(self,
+                     app_name: str = None,
+                     num_executors: int = None,
+                     executor_cores: int = None,
+                     executor_memory: str = None,
+                     configs=None,
+                     args: PreProcArguments = None):
+        app_name = app_name or self.args.spark_app_name
+        num_executors = num_executors or self.args.spark_num_executors
+        executor_cores = executor_cores or self.args.spark_executor_cores
+        executor_memory = executor_memory or self.args.spark_executor_memory
+        configs = configs or self.args.spark_extra_config
+        args = args or self.args.pre_proc_args
+        try:
+            # start up spark cluster
+            spark = raydp.init_spark(app_name=app_name,
+                                     num_executors=num_executors,
+                                     executor_cores=executor_cores,
+                                     executor_memory=executor_memory,
+                                     configs=configs)
+            # preprocessing
+            train_folder, test_folder, model_size = pre_process(spark, args)
+            self.train_folder = train_folder
+            self.test_folder = test_folder
+            self.model_size = model_size
 
-    # set up cluster for distributed training
-    executors = []
-    for i in range(num_workers):
-        executors.append(Executor.options(num_cpus=cores_per_worker).remote(inter_op_parallelism,
-                                                                            intra_op_parallelism,
-                                                                            num_workers,
-                                                                            args.model_args))
+            return self.train_folder, self.test_folder, self.model_size
+        except:
+            raise
+        finally:
+            raydp.stop_spark()
 
-    # get master address and port
-    master_addr, master_port = ray.get(executors[0].setup_address.remote())
+    def setup_cluster(self, args: ModelArguments = None):
+        remote_cls = Executor.options(num_cpus=self.cores_per_worker)
+        args = args or self.args.model_args
+        for i in range(self.num_workers):
+            self.executors.append(remote_cls.remote(self.inter_op_parallelism,
+                                                    self.intra_op_parallelism,
+                                                    self.num_workers,
+                                                    args))
+        # get master address and port
+        master_addr, master_port = ray.get(self.executors[0].setup_address.remote())
 
-    # set up process group
-    ray.get([executor.setup_process_group.remote(master_addr, master_port, i)
-             for i, executor in enumerate(executors)])
+        # set up process group
+        ray.get([executor.setup_process_group.remote(master_addr, master_port, i)
+                 for i, executor in enumerate(self.executors)])
 
-    # set up dataset
-    ids = []
-    for i, executor in enumerate(executors):
-        train_dataset = create_torch_ds(train_ds, num_workers, i,
-                                        args.model_args.mini_batch_size,
-                                        args.model_args.mlperf_bin_shuffle)
-        test_dataset = None
-        ids.append(executor.set_dataset.remote(train_dataset, test_dataset))
-    ray.get(ids)
+    def train(self,
+              train_folder: str = None,
+              test_folder: str = None,
+              model_size=None,
+              args: ModelArguments = None,
+              nbatches: int = -1,
+              nbatches_test: int = -1):
 
-    # create model
-    ln_emb = list(model_size.values())
-    ray.get([executor.create_model.remote(ln_emb) for executor in executors])
+        train_folder = train_folder or self.train_folder
+        test_folder = test_folder or self.test_folder
+        model_size = model_size or self.model_size
+        args = args or self.args.model_args
 
-    # train model
-    nbatches = -1
-    nbatches_test = -1
-    ray.get([executor.train.remote(nbatches, nbatches_test) for executor in executors])
+        # set up dataset
+        train_ds = ml_data.read_parquet(train_folder, self.num_workers * self.multiple_for_ml_ds)
+        if test_folder:
+            test_ds = ml_data.read_parquet(train_folder, self.num_workers * self.multiple_for_ml_ds)
+        else:
+            test_ds = None
+        ids = []
+        for i, executor in enumerate(self.executors):
+            train_dataset = create_torch_ds(train_ds, self.num_workers, i,
+                                            args.mini_batch_size,
+                                            args.mlperf_bin_shuffle)
+            test_dataset = None
+            if test_ds is not None:
+                test_dataset = create_torch_ds(test_ds, self.num_workers,
+                                               i, args.test_mini_batch_size, False)
+            ids.append(executor.set_dataset.remote(train_dataset, test_dataset))
+        ray.get(ids)
+
+        # create model
+        ln_emb = list(model_size.values())
+        ray.get([executor.create_model.remote(ln_emb) for executor in self.executors])
+
+        # train model
+        ray.get([executor.train.remote(nbatches, nbatches_test) for executor in self.executors])
+
+    def stop(self):
+        ray.get([executor.__ray_terminate__.remote() for executor in self.executors])
+        del self.executors
