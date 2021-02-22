@@ -618,7 +618,7 @@ class ModelArguments:
                  dist_backend: str = "",
                  backend_url: str = "",
                  sparse_dense_boundary: int = 2048,
-                 fp16: bool = False,
+                 bf16: bool = False,
                  use_ipex: bool = False,
                  arch_dense_feature_size: int = 2,
                  arch_sparse_feature_size: int = 2,
@@ -631,7 +631,7 @@ class ModelArguments:
                  md_threshold: int = 200,
                  md_temperature: float = 0.3,
                  md_round_dims: bool = False,
-                 qr_flat: bool = False,
+                 qr_flag: bool = False,
                  qr_threshold: int = 200,
                  qr_operation: str = "mult",
                  qr_collisions: int = 4,
@@ -685,7 +685,7 @@ class ModelArguments:
         self.dist_backend = dist_backend
         self.backend_url = backend_url
         self.sparse_dense_boundary = sparse_dense_boundary
-        self.fp16 = fp16
+        self.bf16 = bf16
         self.use_ipex = use_ipex
 
         self.arch_dense_feature_size: int = arch_dense_feature_size
@@ -699,7 +699,7 @@ class ModelArguments:
         self.md_threshold: int =md_threshold
         self.md_temperature: float = md_temperature
         self.md_round_dims: bool = md_round_dims
-        self.qr_flat: bool = qr_flat
+        self.qr_flag: bool = qr_flag
         self.qr_threshold: int = qr_threshold
         self.qr_operation: str = qr_operation
         self.qr_collisions: int = qr_collisions
