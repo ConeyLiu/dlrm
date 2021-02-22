@@ -822,9 +822,7 @@ class Executor:
 
 
 class DLRMRunArguments:
-    def __init__(self, ray_address: str,
-                 ray_redis_password: str,
-                 ray_node_ip_address: str,
+    def __init__(self,
                  spark_app_name: str,
                  spark_num_executors: int,
                  spark_executor_cores: int,
@@ -832,11 +830,6 @@ class DLRMRunArguments:
                  spark_extra_config: Dict,
                  pre_proc_args: PreProcArguments,
                  model_args: ModelArguments):
-
-        # ray arguments
-        self.ray_address = ray_address
-        self.ray_redis_password = ray_redis_password
-        self.ray_node_ip_address = ray_node_ip_address
 
         # spark arguments
         self.spark_app_name = spark_app_name
@@ -955,10 +948,7 @@ def dlrm_run(num_workers: int,
 
     assert cores_per_worker == (inter_op_parallelism * intra_op_parallelism)
 
-    # connect to ray
-    ray.init(address=args.ray_address,
-             _redis_password=args.ray_redis_password,
-             _node_ip_address=args.ray_node_ip_address)
+    assert ray.is_initialized()
 
     try:
         # start up spark cluster
