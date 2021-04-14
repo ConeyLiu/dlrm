@@ -92,15 +92,14 @@ def init_distributed(rank = -1, size = -1, backend=''):
             print("Using CCL_ATL_SHM=%s" % os.environ.get('CCL_ATL_SHM', '(default)'))
         if hasattr(dist, 'all_to_all_single'):
             try:
-                dist.all_to_all_single(torch.empty([0]), torch.empty([0]))
+                # dist.all_to_all_single(torch.empty([0]), torch.empty([0]))
                 alltoall_supported = True
-            except Exception:
+            except RuntimeError:
                 pass
         if a2a_impl == 'alltoall' and alltoall_supported == False:
             print("Requested DLRM_ALLTOALL_IMPL=%s but backend %s does not support it, use scatter/gather based alltoall" % (a2a_impl, backend))
             a2a_impl = 'scatter'
-        if a2a_impl != '':
-            print("Using DLRM_ALLTOALL_IMPL=%s" % a2a_impl)
+        if a2a_impl != '': print("Using DLRM_ALLTOALL_IMPL=%s" % a2a_impl)
         try:
             x = torch.ones([my_rank])
             y = torch.zeros([(my_size*(my_size-1))//2])
@@ -410,17 +409,8 @@ def alltoall(inputs, per_rank_split_lengths):
 def shuffle_data(inputs):
     input = torch.cat(inputs)
     output = input.new_empty(input.size())
-
-    if alltoall_supported:
-        req = dist.all_to_all_single(output, input)
-        output = output.reshape(my_size, -1)
-    else:
-        scatter_list = list(input.chunk(my_size))
-        gather_list = list(output.chunk(my_size))
-        for i in range(my_size):
-            dist.scatter(gather_list[i], scatter_list if i == my_rank else [], src=i)
-        output = torch.cat(gather_list)
-        output = output.reshape(my_size, -1)
+    req = dist.all_to_all_single(output, input)
+    output = output.reshape(my_size, -1)
     return output
     
 
