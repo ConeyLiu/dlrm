@@ -1,14 +1,22 @@
 import functools
+from typing import List
 
-import numpy as np
 import pandas as pd
+import ray
 import ray.util.data as ml_data
+import ray.util.iter as parallel_it
 import raydp
+from raydp.spark.dataset import RayMLDataset
+import time
 import torch
+from pyspark.sql.dataframe import DataFrame
+from raydp.spark.dataset import _save_spark_df_to_object_store
 from torch.utils.data.dataset import IterableDataset
 
 from .dlrm_s_pytorch import ModelArguments
 from .preproc.spark_preproc import pre_process, PreProcArguments
+
+columns = [f"_c{i}" for i in range(40)]
 
 
 def collate_fn(
@@ -16,10 +24,18 @@ def collate_fn(
         num_numerical_features: int,
         max_ind_range: int,
         flag_input_torch_tensor=False):
-    array = df.values
-    x_int_batch = array[:, 1:1 + num_numerical_features].view(dtype=np.float32)
-    x_cat_batch = array[:, 1 + num_numerical_features:]
-    y_batch = array[:, 0]
+    #df = df[columns]
+    # array = df.values
+    # x_int_batch = array[:, 1:1 + num_numerical_features].astype(dtype=np.float32)
+    # x_cat_batch = array[:, 1 + num_numerical_features:].astype(dtype=np.int64)
+    # y_batch = array[:, 0].astype(dtype=np.float32)
+    # x_int_batch = torch.from_numpy(x_int_batch)
+    # x_cat_batch = torch.from_numpy(x_cat_batch)
+    # y_batch = torch.from_numpy(y_batch)
+    tensor = torch.from_numpy(df.values).view((-1, 40))
+    x_int_batch = tensor[:, 1:1 + num_numerical_features]
+    x_cat_batch = tensor[:, 1 + num_numerical_features:]
+    y_batch = tensor[:, 0]
 
     if max_ind_range > 0:
         x_cat_batch = x_cat_batch % max_ind_range
@@ -44,7 +60,8 @@ def create_torch_ds(ds: ml_data.MLDataset,
                     num_shards: int,
                     shard_index: int,
                     batch_size: int,
-                    shuffle: bool):
+                    shuffle: bool,
+                    collate_fn):
     assert shard_index < num_shards
     shard_ids = []
     i = shard_index
@@ -53,17 +70,19 @@ def create_torch_ds(ds: ml_data.MLDataset,
         shard_ids.append(i)
         i += step
     ds = ds.select_shards(shard_ids)
-    return TorchDataset(ds, batch_size, shuffle)
+    return TorchDataset(ds, batch_size // num_shards, shuffle, collate_fn)
 
 
 class TorchDataset(IterableDataset):
     def __init__(self,
                  ds: ml_data.MLDataset,
                  batch_size: int,
-                 shuffle: bool):
+                 shuffle: bool,
+                 collate_fn):
         self.ds = ds
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.collate_fn = collate_fn
 
     def __iter__(self):
         it = self.ds.gather_async(batch_ms=0, num_async=self.ds.num_shards())
@@ -94,7 +113,7 @@ class TorchDataset(IterableDataset):
                     if return_df.shape[0] == self.batch_size:
                         if self.shuffle:
                             return_df = return_df.sample(frac=1)
-                        yield return_df
+                        yield self.collate_fn(return_df)
                         return_df = None
             except StopIteration:
                 break
@@ -102,7 +121,7 @@ class TorchDataset(IterableDataset):
         if return_df is not None:
             if self.shuffle:
                 return_df = return_df.sample(frac=1)
-            yield return_df
+            yield self.collate_fn(return_df)
 
 
 def data_preprocess(
@@ -111,7 +130,8 @@ def data_preprocess(
         executor_cores: int = None,
         executor_memory: str = None,
         configs=None,
-        args: PreProcArguments = None):
+        args: PreProcArguments = None,
+        return_df: bool = True):
     try:
         spark = raydp.init_spark(
             app_name=app_name,
@@ -120,62 +140,72 @@ def data_preprocess(
             executor_memory=executor_memory,
             configs=configs)
 
-        train_folder, test_folder, model_size = pre_process(spark, args)
-        return train_folder, test_folder, model_size
+        train_data, test_data, model_size = pre_process(spark, args, return_df)
+        return train_data, test_data, model_size
     except:
         raise
     finally:
-        raydp.stop_spark()
+        if not return_df:
+            raydp.stop_spark()
+
+
+def create_ml_dataset_from_spark(df: DataFrame,
+                                 num_workers: int,
+                                 actors: List[ray.actor.ActorHandle]):
+    start = time.time()
+    assert num_workers == len(actors)
+    df = df.repartition(num_workers)
+    record_batch_set = _save_spark_df_to_object_store(df, num_workers, True)
+    ray.get([actor.init.remote(batch, False) for actor, batch in zip(actors, record_batch_set)])
+    it = parallel_it.from_actors(actors, "DataFrame MLDataset")
+    ds = ml_data.from_parallel_iter(it, need_convert=False, batch_size=0, repeated=False)
+    print(f"Duration: {time.time() - start}")
+    return ds
 
 
 def create_train_task(
         num_workers: int = None,
-        train_folder: str = None,
-        test_folder: str = None,
+        train_ds: ml_data.MLDataset = None,
+        test_ds: ml_data.MLDataset = None,
         model_size=None,
         args: ModelArguments = None,
         nbatches: int = -1,
         nbatches_test: int = -1):
-    # setup dataset
-    train_ds = ml_data.read_parquet(train_folder, num_workers)
-    if test_folder:
-        test_ds = ml_data.read_parquet(test_folder, num_workers)
-    else:
-        test_ds = None
 
     fn = functools.partial(collate_fn,
                            num_numerical_features=args.arch_dense_feature_size,
                            max_ind_range=args.max_ind_range,
-                           flag_input_torch_tensor=False)
+                           flag_input_torch_tensor=True)
 
     def task_fn(context):
-
-        train_dataset = create_torch_ds(train_ds, num_workers, context.world_rank,
-            args.mini_batch_size, args.mlperf_bin_shuffle)
+        train_loader = None
+        if train_ds is not None:
+            train_dataset = create_torch_ds(train_ds, num_workers, context.world_rank,
+                args.mini_batch_size, args.mlperf_bin_shuffle, fn)
         
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=None,
-            batch_sampler=None,
-            shuffle=False,
-            num_workers=0,
-            collate_fn=fn,
-            pin_memory=False,
-            drop_last=False,
-            sampler=None
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset,
+                batch_size=None,
+                batch_sampler=None,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=None,
+                pin_memory=False,
+                drop_last=False,
+                sampler=None
         )
 
         test_loader = None
         if test_ds is not None:
             test_dataset = create_torch_ds(test_ds, num_workers, context.world_rank,
-                args.mini_batch_size, False)
+                args.mini_batch_size, False, fn)
             test_loader = torch.utils.data.DataLoader(
                 test_ds,
                 batch_size=None,
                 batch_sampler=None,
                 shuffle=False,
                 num_workers=0,
-                collate_fn=fn,
+                collate_fn=None,
                 pin_memory=False,
                 drop_last=False,
                 sampler=None

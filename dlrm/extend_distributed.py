@@ -275,9 +275,9 @@ class All2All_Req(Function):
         if mb_split_lengths: mb_split_lengths = [m * a2ai.lS * a2ai.E for m in mb_split_lengths]
         emb_split_lengths = a2ai.gSS
         if emb_split_lengths: emb_split_lengths = [a2ai.lN * e * a2ai.E for e in emb_split_lengths]
-        input = torch.cat(inputs, dim=1).view([-1])
-        output = input.new_empty([a2ai.S*a2ai.lN*a2ai.E])
-        req = dist.all_to_all_single(output, input, emb_split_lengths, mb_split_lengths, async_op=True)
+        inputs = torch.cat(inputs, dim=1).view([-1])
+        output = inputs.new_empty([a2ai.S*a2ai.lN*a2ai.E])
+        req = dist.all_to_all_single(output, inputs, emb_split_lengths, mb_split_lengths, async_op=True)
         myreq.req = req
         myreq.tensor = []
         myreq.tensor.append(output)
@@ -407,12 +407,12 @@ def alltoall(inputs, per_rank_split_lengths):
     return myreq
 
 def shuffle_data(inputs):
-    input = torch.cat(inputs)
-    output = input.new_empty(input.size())
-    req = dist.all_to_all_single(output, input)
+    inputs = torch.cat(inputs)
+    output = inputs.new_empty(inputs.size())
+    req = dist.all_to_all_single(output, inputs)
     output = output.reshape(my_size, -1)
     return output
-    
+
 
 def all_gather(input, lengths, dim=0):
     #print("lengths: ", lengths)

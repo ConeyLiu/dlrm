@@ -248,6 +248,9 @@ def load_raw(spark, folder, day_range):
             .option('sep', '\t')
             .csv(paths))
 
+    # paths = [os.path.join(folder, 'day_%d' % i) for i in day_range]
+    # return spark.read.parquet(*paths)
+
 
 def rand_ordinal(df):
     # create a random long from the double precision float.
@@ -395,7 +398,8 @@ class PreProcArguments:
 def generate_models(spark, args: PreProcArguments, day_range):
     days = len(day_range)
     df = load_raw(spark, args.input_folder, day_range)
-    spark.conf.set('spark.sql.shuffle.partitions', days * args.dict_build_shuffle_parallel_per_day)
+    if spark.conf.get("spark.sql.adaptive.enabled") != "true":
+        spark.conf.set('spark.sql.shuffle.partitions', days * args.dict_build_shuffle_parallel_per_day)
 
     with _timed('generate models'):
         col_counts = get_column_counts_with_frequency_limit(df, args.frequency_limit)
@@ -429,10 +433,12 @@ def generate_models(spark, args: PreProcArguments, day_range):
             delete_combined_model(spark, args.model_folder)
 
 
-def transform(spark, args: PreProcArguments, day_range, is_train: bool):
+def transform(spark, args: PreProcArguments, day_range, is_train: bool, return_df: bool):
     days = len(day_range)
+    #args.low_mem = False
     df = load_raw(spark, args.input_folder, day_range)
-    spark.conf.set('spark.sql.shuffle.partitions', days * args.apply_shuffle_parallel_per_day)
+    if spark.conf.get("spark.sql.adaptive.enabled") != "true":
+        spark.conf.set('spark.sql.shuffle.partitions', days * args.apply_shuffle_parallel_per_day)
     model_size = None
     with _timed('transform'):
         if args.output_ordering == 'total_random':
@@ -500,24 +506,31 @@ def transform(spark, args: PreProcArguments, day_range, is_train: bool):
             output_folder = args.output_folder + "/train/"
         else:
             output_folder = args.output_folder + "/test/"
-        df.write.parquet(
-            output_folder,
-            mode=args.write_mode,
-            partitionBy=partitionBy)
-        return output_folder, model_size
+
+        cols = [f"_c{i}" for i in range(40)]
+        df = df.select(*cols)
+        if return_df:
+            return df, model_size
+        else:
+            df.write.parquet(
+                output_folder,
+                mode=args.write_mode,
+                partitionBy=partitionBy)
+            return output_folder, model_size
 
 
-def pre_process(spark, args: PreProcArguments):
+def pre_process(spark, args: PreProcArguments, return_df):
     # generate models
     generate_models(spark, args, args.train_days_range)
 
     # transform for train data
-    train_folder, model_size = transform(spark, args, args.train_days_range, True)
+    train_data, model_size = transform(spark, args, args.train_days_range, True, return_df)
 
     # transform for test data
-    test_folder, _ = transform(spark, args, args.test_days_range, False)
+    args.low_mem = False
+    test_data, _ = transform(spark, args, args.test_days_range, False, return_df)
 
     print('=' * 100)
     print(_benchmark)
 
-    return train_folder, test_folder, model_size
+    return train_data, test_data, model_size

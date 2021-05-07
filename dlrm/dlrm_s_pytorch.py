@@ -654,6 +654,7 @@ class ModelArguments:
                  max_ind_range: int = -1,
                  data_sub_saple_rate: float = 0.0,
                  num_indices_per_lookup: int = 10,
+                 num_indices_per_lookup_fixed: bool = False,
                  num_workers: int = 0,
                  memory_map: bool = False,
                  mini_batch_size: int = 1,
@@ -722,6 +723,7 @@ class ModelArguments:
         self.max_ind_range: int = max_ind_range
         self.data_sub_saple_rate: float = data_sub_saple_rate
         self.num_indices_per_lookup: int = num_indices_per_lookup
+        self.num_indices_per_lookup_fixed: bool = num_indices_per_lookup_fixed
         self.num_workers: int =num_workers
         self.memory_map: bool = memory_map
         self.mini_batch_size: int = mini_batch_size
@@ -822,43 +824,39 @@ def model_training(args: ModelArguments,
     mlperf_logger.barrier()
     mlperf_logger.log_start(key=mlperf_logger.constants.RUN_START)
     mlperf_logger.barrier()
+    
+    if train_ld is not None:
+        ### prepare data set
+        ln_emb = list(model_size.values())
+        # enforce maximum limit on number of vectors per embedding
+        if args.max_ind_range > 0:
+            ln_emb = np.array(list(map(
+                lambda x: x if x < args.max_ind_range else args.max_ind_range, ln_emb)))
 
-
-    ### prepare data set
-    ln_emb = list(model_size.values())
-    # enforce maximum limit on number of vectors per embedding
-    if args.max_ind_range > 0:
-        ln_emb = np.array(list(map(
-            lambda x: x if x < args.max_ind_range else args.max_ind_range,
-            ln_emb
-        )))
-
-    m_den = args.arch_dense_feature_size
-    ln_bot[0] = m_den
-
-    # if (args.data_generation == "dataset"):
-    #     train_data, train_ld, test_data, test_ld = \
-    #         dp.make_criteo_data_and_loaders(args)
-    #     nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
-    #     nbatches_test = len(test_ld)
-    #
-    #     ln_emb = train_data.counts
-    #     # enforce maximum limit on number of vectors per embedding
-    #     if args.max_ind_range > 0:
-    #         ln_emb = np.array(list(map(
-    #             lambda x: x if x < args.max_ind_range else args.max_ind_range,
-    #             ln_emb
-    #         )))
-    #     m_den = train_data.m_den
-    #     ln_bot[0] = m_den
-    #
-    # else:
-    #     # input and target at random
-    #     ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
-    #     m_den = ln_bot[0]
-    #     train_data, train_ld = dp.make_random_data_and_loader(args, ln_emb, m_den)
-    #     nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
-
+        m_den = args.arch_dense_feature_size
+        ln_bot[0] = m_den
+    elif (args.data_generation == "dataset"):
+        train_data, train_ld, test_data, test_ld = \
+            dp.make_criteo_data_and_loaders(args)
+        nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
+        nbatches_test = len(test_ld)
+    
+        ln_emb = train_data.counts
+        # enforce maximum limit on number of vectors per embedding
+        if args.max_ind_range > 0:
+            ln_emb = np.array(list(map(
+                lambda x: x if x < args.max_ind_range else args.max_ind_range,
+                ln_emb
+            )))
+        m_den = train_data.m_den
+        ln_bot[0] = m_den
+    else:
+        # input and target at random
+        ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
+        m_den = ln_bot[0]
+        train_data, train_ld = dp.make_random_data_and_loader(args, ln_emb, m_den)
+        nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
+        
     ### parse command line arguments ###
     m_spa = args.arch_sparse_feature_size
     num_fea = ln_emb.size + 1  # num sparse + num dense features
@@ -1271,6 +1269,7 @@ def model_training(args: ModelArguments,
                 print(Z.detach().cpu().numpy())
                 print(E.detach().cpu().numpy())
                 '''
+                #print(E.detach().cpu().numpy(), flush=True)
                 # compute loss and accuracy
                 L = E.detach().cpu().numpy()  # numpy array
                 S = Z.detach().cpu().numpy()  # numpy array

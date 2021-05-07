@@ -386,7 +386,8 @@ def make_criteo_data_and_loaders(args):
             train_file = d_path + "_train.bin"
             test_file = d_path + "_test.bin"
             # val_file = d_path + "_val.bin"
-            counts_file = args.raw_data_file + '_fea_count.npz'
+            #counts_file = args.raw_data_file + '_fea_count.npz'
+            counts_file = d_path + '_fea_count.npz'
 
             if any(not path.exists(p) for p in [train_file,
                                                 test_file,
