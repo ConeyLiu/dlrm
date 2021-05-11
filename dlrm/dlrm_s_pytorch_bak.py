@@ -55,13 +55,13 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # miscellaneous
 import builtins
-import functools
 # import bisect
 # import shutil
 import time
 import json
+import sys
 # data generation
-import dlrm_data_pytorch as dp
+from dlrm import dlrm_data_pytorch as dp, extend_distributed as ext_dist, mlperf_logger
 
 # numpy
 import numpy as np
@@ -82,22 +82,16 @@ from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.scatter_gather import gather, scatter
 
 # For distributed run
-import extend_distributed as ext_dist
 
-try:
-    import intel_pytorch_extension as ipex
-    from intel_pytorch_extension import core
-except:
-    pass
-from lamb_bin import Lamb, log_lamb_rs
+import intel_pytorch_extension as ipex
+from intel_pytorch_extension import core
 
 # quotient-remainder trick
-from tricks.qr_embedding_bag import QREmbeddingBag
+from dlrm.tricks.qr_embedding_bag import QREmbeddingBag
 # mixed-dimension trick
-from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
+from dlrm.tricks.md_embedding_bag import PrEmbeddingBag, md_solver
 
 import sklearn.metrics
-import mlperf_logger
 
 # from torchviz import make_dot
 # import torch.nn.functional as Functional
@@ -106,6 +100,8 @@ import mlperf_logger
 from torch.optim.lr_scheduler import _LRScheduler
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
+device = None
+
 
 class LRPolicyScheduler(_LRScheduler):
     def __init__(self, optimizer, num_warmup_steps, decay_start_step, num_decay_steps):
@@ -117,11 +113,7 @@ class LRPolicyScheduler(_LRScheduler):
         if self.decay_start_step < self.num_warmup_steps:
             sys.exit("Learning rate warmup must finish before the decay starts")
 
-        if isinstance(optimizer, tuple):
-            for opt in optimizer:
-                super(LRPolicyScheduler, self).__init__(opt)
-        else:
-            super(LRPolicyScheduler, self).__init__(optimizer)
+        super(LRPolicyScheduler, self).__init__(optimizer)
 
     def get_lr(self):
         step_count = self._step_count
@@ -257,16 +249,8 @@ class DLRM_Net(nn.Module):
                 ).astype(np.float32)
                 # approach 1
                 if n >= self.sparse_dense_boundary:
-                    #n = 39979771
-                    m_sparse = 16
-                    W = np.random.uniform(
-                        low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m_sparse)
-                    ).astype(np.float32)
-                    EE = nn.EmbeddingBag(n, m_sparse, mode="sum", sparse=True, _weight=torch.tensor(W, requires_grad=True))
+                    EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True, _weight=torch.tensor(W, requires_grad=True))
                 else:
-                    W = np.random.uniform(
-                        low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
-                    ).astype(np.float32)
                     EE = nn.EmbeddingBag(n, m, mode="sum", sparse=False, _weight=torch.tensor(W, requires_grad=True))
                 # approach 2
                 # EE.weight.data.copy_(torch.tensor(W))
@@ -404,7 +388,7 @@ class DLRM_Net(nn.Module):
 
         # print(ly)
         return ly
-#if self.bf16:
+
     def interact_features(self, x, ly):
         x = x.to(ly[0].dtype)
         if self.arch_interaction_op == "dot":
@@ -507,12 +491,7 @@ class DLRM_Net(nn.Module):
         # dense embeddings
         ly_dense = self.apply_emb(lS_o_dense, lS_i_dense, self.emb_dense)
         ly_sparse = a2a_req.wait()
-        ly_sparse2 = []
-        for i in range(len(ly_sparse)):
-            ly_sparse2.append(ly_sparse[i].repeat(1,4))
-        del ly_sparse
-        #ly_sparse ""= torch.cat(ly_sparse,1)
-        ly = ly_dense + list(ly_sparse2)
+        ly = ly_dense + list(ly_sparse)
         # interactions
         z = self.interact_features(x, ly)
         # top mlp
@@ -636,7 +615,152 @@ class DLRM_Net(nn.Module):
         return z0
 
 
-if __name__ == "__main__":
+class ModelArguments:
+    def __init__(self,
+                 dist_backend: str = "",
+                 backend_url: str = "",
+                 sparse_dense_boundary: int = 2048,
+                 bf16: bool = False,
+                 use_ipex: bool = False,
+                 arch_dense_feature_size: int = 2,
+                 arch_sparse_feature_size: int = 2,
+                 arch_embedding_size: str = "4-3-2",
+                 arch_mlp_bot: str = "4-3-2",
+                 arch_mlp_top: str = "4-3-2",
+                 arch_interaction_op: str = "dot",
+                 arch_interaction_itself: bool = False,
+                 md_flag: False = False,
+                 md_threshold: int = 200,
+                 md_temperature: float = 0.3,
+                 md_round_dims: bool = False,
+                 qr_flag: bool = False,
+                 qr_threshold: int = 200,
+                 qr_operation: str = "mult",
+                 qr_collisions: int = 4,
+                 activation_function: str = "relu",
+                 loss_function: str = "mse",
+                 loss_weights: str = "1.0-1.0",
+                 loss_threshold: float = 0.0,
+                 round_targets: bool = False,
+                 data_size: int = 1,
+                 num_batches: int = 0,
+                 data_generation: str = "random",
+                 data_trace_file: str = "./input/dist_emb_j.log",
+                 data_set: str = "kaggle",
+                 raw_data_file: str = "",
+                 processed_data_file: str = "",
+                 data_randomize: str = "total",
+                 data_trace_enable_padding: bool = False,
+                 max_ind_range: int = -1,
+                 data_sub_saple_rate: float = 0.0,
+                 num_indices_per_lookup: int = 10,
+                 num_indices_per_lookup_fixed: bool = False,
+                 num_workers: int = 0,
+                 memory_map: bool = False,
+                 mini_batch_size: int = 1,
+                 nepochs: int = 1,
+                 learning_rate: float = 0.01,
+                 print_precision: int = 5,
+                 numpy_rand_seed: int = 123,
+                 sync_dense_params: bool = True,
+                 inference_only: bool = False,
+                 save_onnx: bool = False,
+                 use_gpu: bool = False,
+                 print_freq: int = 1,
+                 test_freq: int = -1,
+                 test_mini_batch_size: int = -1,
+                 test_num_workers: int = -1,
+                 print_time: bool = False,
+                 debug_mode: bool = False,
+                 enable_profiling: bool = False,
+                 plot_compute_graph: bool = False,
+                 save_model: str = "",
+                 load_model: str = "",
+                 mlperf_logging: bool = False,
+                 mlperf_acc_threshold: float = 0.0,
+                 mlperf_auc_threshold: float = 0.0,
+                 mlperf_bin_loader: bool = False,
+                 mlperf_bin_shuffle: bool = False,
+                 lr_num_warmup_steps: int = 0,
+                 lr_decay_start_step: int = 0,
+                 lr_num_decay_steps: int = 0):
+
+        self.dist_backend = dist_backend
+        self.backend_url = backend_url
+        self.sparse_dense_boundary = sparse_dense_boundary
+        self.bf16 = bf16
+        self.use_ipex = use_ipex
+
+        self.arch_dense_feature_size: int = arch_dense_feature_size
+        self.arch_sparse_feature_size: int = arch_sparse_feature_size
+        self.arch_embedding_size: str = arch_embedding_size
+        self.arch_mlp_bot: str = arch_mlp_bot
+        self.arch_mlp_top: str = arch_mlp_top
+        self.arch_interaction_op: str = arch_interaction_op
+        self.arch_interaction_itself: bool = arch_interaction_itself
+        self.md_flag: False = md_flag
+        self.md_threshold: int =md_threshold
+        self.md_temperature: float = md_temperature
+        self.md_round_dims: bool = md_round_dims
+        self.qr_flag: bool = qr_flag
+        self.qr_threshold: int = qr_threshold
+        self.qr_operation: str = qr_operation
+        self.qr_collisions: int = qr_collisions
+        self.activation_function: str = activation_function
+        self.loss_function: str = loss_function
+        self.loss_weights: str = loss_weights
+        self.loss_threshold: float = loss_threshold
+        self.round_targets: bool = round_targets
+        self.data_size: int = data_size
+        self.num_batches: int = num_batches
+        self.data_generation: str = data_generation
+        self.data_trace_file: str = data_trace_file
+        self.data_set: str = data_set
+        self.raw_data_file: str = raw_data_file
+        self.processed_data_file: str = processed_data_file
+        self.data_randomize: str = data_randomize
+        self.data_trace_enable_padding: bool = data_trace_enable_padding
+        self.max_ind_range: int = max_ind_range
+        self.data_sub_saple_rate: float = data_sub_saple_rate
+        self.num_indices_per_lookup: int = num_indices_per_lookup
+        self.num_indices_per_lookup_fixed: bool = num_indices_per_lookup_fixed
+        self.num_workers: int =num_workers
+        self.memory_map: bool = memory_map
+        self.mini_batch_size: int = mini_batch_size
+        self.nepochs: int = nepochs
+        self.learning_rate: float = learning_rate
+        self.print_precision: int = print_precision
+        self.numpy_rand_seed: int = numpy_rand_seed
+        self.sync_dense_params: bool = sync_dense_params
+        self.inference_only: bool = inference_only
+        self.save_onnx: bool = save_onnx
+        self.use_gpu: bool = use_gpu
+        self.print_freq: int = print_freq
+        self.test_freq: int = test_freq
+        self.test_mini_batch_size: int = test_mini_batch_size
+        self.test_num_workers: int = test_num_workers
+        self.print_time: bool = print_time
+        self.debug_mode: bool = debug_mode
+        self.enable_profiling: bool = enable_profiling
+        self.plot_compute_graph: bool = plot_compute_graph
+        self.save_model: str = save_model
+        self.load_model: str = load_model
+        self.mlperf_logging: bool = mlperf_logging
+        self.mlperf_acc_threshold: float = mlperf_acc_threshold
+        self.mlperf_auc_threshold: float = mlperf_auc_threshold
+        self.mlperf_bin_loader: bool = mlperf_bin_loader
+        self.mlperf_bin_shuffle: bool = mlperf_bin_shuffle
+        self.lr_num_warmup_steps: int = lr_num_warmup_steps
+        self.lr_decay_start_step: int = lr_decay_start_step
+        self.lr_num_decay_steps: int = lr_num_decay_steps
+
+
+def model_training(args: ModelArguments,
+                   train_ld,
+                   test_ld,
+                   model_size,
+                   nbatches=-1,
+                   nbatches_test=-1):
     # the reference implementation doesn't clear the cache currently
     # but the submissions are required to do that
     mlperf_logger.log_event(key=mlperf_logger.constants.CACHE_CLEAR, value=True)
@@ -645,106 +769,6 @@ if __name__ == "__main__":
 
     ### import packages ###
     import sys
-    import os
-    import argparse
-
-    ### parse arguments ###
-    parser = argparse.ArgumentParser(
-        description="Train Deep Learning Recommendation Model (DLRM)"
-    )
-    # model related parameters
-    parser.add_argument("--arch-sparse-feature-size", type=int, default=2)
-    parser.add_argument("--arch-embedding-size", type=str, default="4-3-2")
-    # j will be replaced with the table number
-    parser.add_argument("--arch-mlp-bot", type=str, default="4-3-2")
-    parser.add_argument("--arch-mlp-top", type=str, default="4-2-1")
-    parser.add_argument("--arch-interaction-op", type=str, default="dot")
-    parser.add_argument("--arch-interaction-itself", action="store_true", default=False)
-    # embedding table options
-    parser.add_argument("--md-flag", action="store_true", default=False)
-    parser.add_argument("--md-threshold", type=int, default=200)
-    parser.add_argument("--md-temperature", type=float, default=0.3)
-    parser.add_argument("--md-round-dims", action="store_true", default=False)
-    parser.add_argument("--qr-flag", action="store_true", default=False)
-    parser.add_argument("--qr-threshold", type=int, default=200)
-    parser.add_argument("--qr-operation", type=str, default="mult")
-    parser.add_argument("--qr-collisions", type=int, default=4)
-    # activations and loss
-    parser.add_argument("--activation-function", type=str, default="relu")
-    parser.add_argument("--loss-function", type=str, default="mse")  # or bce or wbce
-    parser.add_argument("--loss-weights", type=str, default="1.0-1.0")  # for wbce
-    parser.add_argument("--loss-threshold", type=float, default=0.0)  # 1.0e-7
-    parser.add_argument("--round-targets", type=bool, default=False)
-    # data
-    parser.add_argument("--data-size", type=int, default=1)
-    parser.add_argument("--num-batches", type=int, default=0)
-    parser.add_argument(
-        "--data-generation", type=str, default="random"
-    )  # synthetic or dataset
-    parser.add_argument("--data-trace-file", type=str, default="./input/dist_emb_j.log")
-    parser.add_argument("--data-set", type=str, default="kaggle")  # or terabyte
-    parser.add_argument("--raw-data-file", type=str, default="")
-    parser.add_argument("--processed-data-file", type=str, default="")
-    parser.add_argument("--data-randomize", type=str, default="total")  # or day or none
-    parser.add_argument("--data-trace-enable-padding", type=bool, default=False)
-    parser.add_argument("--max-ind-range", type=int, default=-1)
-    parser.add_argument("--data-sub-sample-rate", type=float, default=0.0)  # in [0, 1]
-    parser.add_argument("--num-indices-per-lookup", type=int, default=10)
-    parser.add_argument("--num-indices-per-lookup-fixed", type=bool, default=False)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--memory-map", action="store_true", default=False)
-    # training
-    parser.add_argument("--mini-batch-size", type=int, default=1)
-    parser.add_argument("--nepochs", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=0.01)
-    parser.add_argument("--print-precision", type=int, default=5)
-    parser.add_argument("--numpy-rand-seed", type=int, default=123)
-    parser.add_argument("--sync-dense-params", type=bool, default=True)
-    # inference
-    parser.add_argument("--inference-only", action="store_true", default=False)
-    # onnx
-    parser.add_argument("--save-onnx", action="store_true", default=False)
-    # gpu
-    parser.add_argument("--use-gpu", action="store_true", default=False)
-    # distributed run
-    parser.add_argument("--dist-backend", type=str, default="")
-    # debugging and profiling
-    parser.add_argument("--print-freq", type=int, default=1)
-    parser.add_argument("--test-freq", type=int, default=-1)
-    parser.add_argument("--test-mini-batch-size", type=int, default=-1)
-    parser.add_argument("--test-num-workers", type=int, default=-1)
-    parser.add_argument("--print-time", action="store_true", default=False)
-    parser.add_argument("--debug-mode", action="store_true", default=False)
-    parser.add_argument("--enable-profiling", action="store_true", default=False)
-    parser.add_argument("--plot-compute-graph", action="store_true", default=False)
-    parser.add_argument("--profiling-start-iter", type=int, default=50)
-    parser.add_argument("--profiling-num-iters", type=int, default=100)
-    # store/load model
-    parser.add_argument("--out-dir", type=str, default=".")
-    parser.add_argument("--save-model", type=str, default="")
-    parser.add_argument("--load-model", type=str, default="")
-    # mlperf logging (disables other output and stops early)
-    parser.add_argument("--mlperf-logging", action="store_true", default=False)
-    # stop at target accuracy Kaggle 0.789, Terabyte (sub-sampled=0.875) 0.8107
-    parser.add_argument("--mlperf-acc-threshold", type=float, default=0.0)
-    # stop at target AUC Terabyte (no subsampling) 0.8025
-    parser.add_argument("--mlperf-auc-threshold", type=float, default=0.0)
-    parser.add_argument("--mlperf-bin-loader", action='store_true', default=False)
-    parser.add_argument("--mlperf-bin-shuffle", action='store_true', default=False)
-    # LR policy
-    parser.add_argument("--lr-num-warmup-steps", type=int, default=0)
-    parser.add_argument("--lr-decay-start-step", type=int, default=0)
-    parser.add_argument("--lr-num-decay-steps", type=int, default=0)
-    # embedding table is sparse table only if sparse_dense_boundary >= 2048
-    parser.add_argument("--sparse-dense-boundary", type=int, default=2048)
-    # bf16 option
-    parser.add_argument("--bf16", action='store_true', default=False)
-    # ipex option
-    parser.add_argument("--use-ipex", action="store_true", default=False)
-    # lamb
-    parser.add_argument("--optimizer", type=int, default=0, help='optimizer:[0:sgd, 1:lamb/sgd, 2:adagrad, 3:sparseadam]')
-
-    args = parser.parse_args()
 
     ext_dist.init_distributed(backend=args.dist_backend)
 
@@ -769,6 +793,7 @@ if __name__ == "__main__":
 
     use_gpu = args.use_gpu and torch.cuda.is_available()
     use_ipex = args.use_ipex
+    global device
     if use_gpu:
         torch.cuda.manual_seed_all(args.numpy_rand_seed)
         torch.backends.cudnn.deterministic = True
@@ -799,13 +824,23 @@ if __name__ == "__main__":
     mlperf_logger.barrier()
     mlperf_logger.log_start(key=mlperf_logger.constants.RUN_START)
     mlperf_logger.barrier()
+    
+    if train_ld is not None:
+        ### prepare data set
+        ln_emb = list(model_size.values())
+        # enforce maximum limit on number of vectors per embedding
+        if args.max_ind_range > 0:
+            ln_emb = np.array(list(map(
+                lambda x: x if x < args.max_ind_range else args.max_ind_range, ln_emb)))
 
-    if (args.data_generation == "dataset"):
+        m_den = args.arch_dense_feature_size
+        ln_bot[0] = m_den
+    elif (args.data_generation == "dataset"):
         train_data, train_ld, test_data, test_ld = \
             dp.make_criteo_data_and_loaders(args)
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
         nbatches_test = len(test_ld)
-
+    
         ln_emb = train_data.counts
         # enforce maximum limit on number of vectors per embedding
         if args.max_ind_range > 0:
@@ -815,14 +850,13 @@ if __name__ == "__main__":
             )))
         m_den = train_data.m_den
         ln_bot[0] = m_den
-
     else:
         # input and target at random
         ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
         m_den = ln_bot[0]
         train_data, train_ld = dp.make_random_data_and_loader(args, ln_emb, m_den)
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
-
+        
     ### parse command line arguments ###
     m_spa = args.arch_sparse_feature_size
     num_fea = ln_emb.size + 1  # num sparse + num dense features
@@ -976,7 +1010,7 @@ if __name__ == "__main__":
         bf16 = args.bf16,
         use_ipex = args.use_ipex
     )
-    
+
     print('Model created!')
     # test prints
     if args.debug_mode:
@@ -1021,46 +1055,27 @@ if __name__ == "__main__":
 
     if not args.inference_only:
         # specify the optimizer algorithm
-        optimizer_list = ([torch.optim.SGD, ([Lamb, False], torch.optim.SGD),
-                           torch.optim.Adagrad, ([torch.optim.Adam, None], torch.optim.SparseAdam)],
-                          [ipex.SplitSGD, ([Lamb, True], ipex.SplitSGD)])
-        optimizers = optimizer_list[args.bf16 and ipex.is_available()][args.optimizer]
-        print('Chosen optimizer(s): %s' % str(optimizers))
-
         if ext_dist.my_size == 1:
-            if len(optimizers) == 1:
-                optimizer = optimizers(dlrm.parameters(), lr=args.learning_rate)
+            if args.bf16 and ipex.is_available():
+                optimizer = ipex.SplitSGD(dlrm.parameters(), lr=args.learning_rate)
             else:
-                optimizer_dense = optimizers[0][0]([
-                    {"params": dlrm.bot_l.parameters(), "lr": args.learning_rate},
-                    {"params": dlrm.top_l.parameters(), "lr": args.learning_rate}
-                ], lr=args.learning_rate)
-                if optimizers[0][1] is not None:
-                    optimizer_dense.set_bf16(optimizers[0][1])
-                optimizer_sparse = optimizers[1]([
-                    {"params": [p for emb in dlrm.emb_l for p in emb.parameters()], "lr": args.learning_rate},
-                ], lr=args.learning_rate)
-                optimizer = (optimizer_dense, optimizer_sparse)
+                optimizer = torch.optim.SGD(dlrm.parameters(), lr=args.learning_rate)
         else:
-            if len(optimizers) == 1:
-                optimizer = optimizers([
-                    {"params": [p for emb in dlrm.emb_sparse for p in emb.parameters()],
-                     "lr": args.learning_rate / ext_dist.my_size},
-                    {"params": [p for emb in dlrm.emb_dense for p in emb.parameters()], "lr": args.learning_rate},
-                    {"params": dlrm.bot_l.parameters(), "lr": args.learning_rate},
-                    {"params": dlrm.top_l.parameters(), "lr": args.learning_rate}
+            if args.bf16 and ipex.is_available():
+                optimizer = ipex.SplitSGD([
+                    {"params": [p for emb in dlrm.emb_sparse for p in emb.parameters()], "lr" : args.learning_rate / ext_dist.my_size},
+                    {"params": [p for emb in dlrm.emb_dense for p in emb.parameters()], "lr" : args.learning_rate},
+                    {"params": dlrm.bot_l.parameters(), "lr" : args.learning_rate},
+                    {"params": dlrm.top_l.parameters(), "lr" : args.learning_rate}
                 ], lr=args.learning_rate)
             else:
-                optimizer_dense = optimizers[0][0]([
-                    {"params": [p for emb in dlrm.emb_dense for p in emb.parameters()], "lr": args.learning_rate},
-                    {"params": dlrm.bot_l.parameters(), "lr": args.learning_rate},
-                    {"params": dlrm.top_l.parameters(), "lr": args.learning_rate}
-                ], lr=args.learning_rate, bf16=args.bf16)
-                optimizer_sparse = optimizers[1]([
-                    {"params": [p for emb in dlrm.emb_sparse for p in emb.parameters()],
-                     "lr": args.learning_rate / ext_dist.my_size},
+                optimizer = torch.optim.SGD([
+                    {"params": [p for emb in dlrm.emb_sparse for p in emb.parameters()], "lr" : args.learning_rate / ext_dist.my_size},
+                    {"params": [p for emb in dlrm.emb_dense for p in emb.parameters()], "lr" : args.learning_rate},
+                    {"params": dlrm.bot_l.parameters(), "lr" : args.learning_rate},
+                    {"params": dlrm.top_l.parameters(), "lr" : args.learning_rate}
                 ], lr=args.learning_rate)
-                optimizer = (optimizer_dense, optimizer_sparse)
+
         lr_scheduler = LRPolicyScheduler(optimizer, args.lr_num_warmup_steps, args.lr_decay_start_step,
                                       args.lr_num_decay_steps)
 
@@ -1194,18 +1209,6 @@ if __name__ == "__main__":
     mlperf_logger.log_event(key='sgd_opt_learning_rate_decay_steps', value=args.lr_num_decay_steps)
     mlperf_logger.log_event(key='sgd_opt_learning_rate_decay_poly_power', value=2)
 
-    # record_shapes=True
-    # if hasattr(torch.autograd.profiler.profile, "resume"):
-    #     prof_support_suspend_resume = True
-    #     prof_arg_dict = {"start_suspended": True}
-    # else:
-    #     prof_support_suspend_resume = False
-    #     prof_arg_dict = { }
-
-    # prof_start_iter = args.profiling_start_iter
-    # prof_end_iter = prof_start_iter + args.profiling_num_iters
-    train_start = time.time()
-    # with torch.autograd.profiler.profile(args.enable_profiling, use_gpu, record_shapes=record_shapes, **prof_arg_dict) as prof:
     with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
         while k < args.nepochs:
             mlperf_logger.barrier()
@@ -1238,11 +1241,8 @@ if __name__ == "__main__":
                     else:
                         iteration_time = 0
                     previous_iteration_time = current_time
-                    # if prof and prof_support_suspend_resume and j == prof_start_iter: prof.resume()
-                    # if prof and prof_support_suspend_resume and j == prof_end_iter: prof.suspend()
                 else:
-                    # ext_dist.barrier()
-                    # if prof and prof_support_suspend_resume and j >= prof_start_iter and j < prof_end_iter: prof.resume()
+                    ext_dist.barrier()
                     t1 = time_wrap(use_gpu)
 
                 # early exit if nbatches was set by the user and has been exceeded
@@ -1269,6 +1269,7 @@ if __name__ == "__main__":
                 print(Z.detach().cpu().numpy())
                 print(E.detach().cpu().numpy())
                 '''
+                #print(E.detach().cpu().numpy(), flush=True)
                 # compute loss and accuracy
                 L = E.detach().cpu().numpy()  # numpy array
                 S = Z.detach().cpu().numpy()  # numpy array
@@ -1279,11 +1280,7 @@ if __name__ == "__main__":
                 if not args.inference_only:
                     # scaled error gradient propagation
                     # (where we do not accumulate gradients across mini-batches)
-                    if args.optimizer == 1 or args.optimizer == 3:
-                        optimizer_dense.zero_grad()
-                        optimizer_sparse.zero_grad()
-                    else:
-                        optimizer.zero_grad()
+                    optimizer.zero_grad()
                     # backward pass
                     E.backward()
                     # debug prints (check gradient norm)
@@ -1292,11 +1289,7 @@ if __name__ == "__main__":
                     #          print(l.weight.grad.norm().item())
 
                     # optimizer
-                    if args.optimizer == 1 or args.optimizer == 3:
-                        optimizer_dense.step()
-                        optimizer_sparse.step()
-                    else:
-                        optimizer.step()
+                    optimizer.step()
                     lr_scheduler.step()
 
                 if args.mlperf_logging:
@@ -1333,7 +1326,7 @@ if __name__ == "__main__":
                             str_run_type, j + 1, nbatches, k, gT
                         )
                         + "loss {:.6f}, accuracy {:3.3f} %".format(gL, gA * 100)
-                    )
+                    , flush=True)
                     # Uncomment the line below to print out the total time with overhead
                     # print("Accumulated time so far: {}" \
                     # .format(time_wrap(use_gpu) - accum_time_begin))
@@ -1342,8 +1335,7 @@ if __name__ == "__main__":
 
                 # testing
                 if should_test and not args.inference_only:
-                    break
-                    epoch_num_float = (j + 1) / len(train_ld) + k + 1
+                    epoch_num_float = -1 #(j + 1) / len(train_ld) + k + 1
                     mlperf_logger.barrier()
                     mlperf_logger.log_start(key=mlperf_logger.constants.EVAL_START,
                                             metadata={mlperf_logger.constants.EPOCH_NUM: epoch_num_float})
@@ -1500,7 +1492,7 @@ if __name__ == "__main__":
                                 validation_results['accuracy'] * 100,
                                 best_gA_test * 100
                             )
-                        )
+                        , flush=True)
                     else:
                         print(
                             "Testing at - {}/{} of epoch {},".format(j + 1, nbatches, 0)
@@ -1521,7 +1513,7 @@ if __name__ == "__main__":
                         and (best_gA_test > args.mlperf_acc_threshold)):
                         print("MLPerf testing accuracy threshold "
                               + str(args.mlperf_acc_threshold)
-                              + " reached, stop training")
+                              + " reached, stop training", flush=True)
                         break
 
                     if (args.mlperf_logging
@@ -1529,17 +1521,12 @@ if __name__ == "__main__":
                         and (best_auc_test > args.mlperf_auc_threshold)):
                         print("MLPerf testing auc threshold "
                               + str(args.mlperf_auc_threshold)
-                              + " reached, stop training")
-                        train_end = time.time()
-                        total_time = train_end - train_start
-                        print(F"Total Time:{total_time}")
+                              + " reached, stop training", flush=True)
                         mlperf_logger.barrier()
                         mlperf_logger.log_end(key=mlperf_logger.constants.RUN_STOP,
                                               metadata={
                                                   mlperf_logger.constants.STATUS: mlperf_logger.constants.SUCCESS})
-                                
                         break
-                    #ext_dist.barrier()
 
             mlperf_logger.barrier()
             mlperf_logger.log_end(key=mlperf_logger.constants.EPOCH_STOP,
@@ -1548,11 +1535,6 @@ if __name__ == "__main__":
             mlperf_logger.log_end(key=mlperf_logger.constants.BLOCK_STOP,
                                   metadata={mlperf_logger.constants.FIRST_EPOCH_NUM: k + 1})
             k += 1  # nepochs
-    train_end = time.time()
-    total_time = train_end - train_start
-    print(F"Total Time:{total_time}")
-    if args.enable_profiling:
-        print(prof.key_averages().table(sort_by="cpu_time_total"))
 
     if args.mlperf_logging and best_auc_test <= args.mlperf_auc_threshold:
         mlperf_logger.barrier()
