@@ -55,13 +55,13 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # miscellaneous
 import builtins
-import functools
 # import bisect
 # import shutil
 import time
 import json
+import sys
 # data generation
-import dlrm_data_pytorch as dp
+from dlrm import dlrm_data_pytorch as dp, extend_distributed as ext_dist, mlperf_logger
 
 # numpy
 import numpy as np
@@ -82,22 +82,17 @@ from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.scatter_gather import gather, scatter
 
 # For distributed run
-import extend_distributed as ext_dist
 
-try:
-    import intel_pytorch_extension as ipex
-    from intel_pytorch_extension import core
-except:
-    pass
-from lamb_bin import Lamb, log_lamb_rs
+from dlrm.lamb import log_lamb_rs, Lamb
+import intel_pytorch_extension as ipex
+from intel_pytorch_extension import core
 
 # quotient-remainder trick
-from tricks.qr_embedding_bag import QREmbeddingBag
+from dlrm.tricks.qr_embedding_bag import QREmbeddingBag
 # mixed-dimension trick
-from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
+from dlrm.tricks.md_embedding_bag import PrEmbeddingBag, md_solver
 
 import sklearn.metrics
-import mlperf_logger
 
 # from torchviz import make_dot
 # import torch.nn.functional as Functional
@@ -106,6 +101,7 @@ import mlperf_logger
 from torch.optim.lr_scheduler import _LRScheduler
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
+device = None
 
 class LRPolicyScheduler(_LRScheduler):
     def __init__(self, optimizer, num_warmup_steps, decay_start_step, num_decay_steps):
@@ -636,115 +632,160 @@ class DLRM_Net(nn.Module):
         return z0
 
 
-if __name__ == "__main__":
+class ModelArguments:
+    def __init__(self,
+                 dist_backend: str = "",
+                 backend_url: str = "",
+                 sparse_dense_boundary: int = 2048,
+                 bf16: bool = False,
+                 use_ipex: bool = False,
+                 arch_dense_feature_size: int = 2,
+                 arch_sparse_feature_size: int = 2,
+                 arch_embedding_size: str = "4-3-2",
+                 arch_mlp_bot: str = "4-3-2",
+                 arch_mlp_top: str = "4-3-2",
+                 arch_interaction_op: str = "dot",
+                 arch_interaction_itself: bool = False,
+                 md_flag: False = False,
+                 md_threshold: int = 200,
+                 md_temperature: float = 0.3,
+                 md_round_dims: bool = False,
+                 qr_flag: bool = False,
+                 qr_threshold: int = 200,
+                 qr_operation: str = "mult",
+                 qr_collisions: int = 4,
+                 activation_function: str = "relu",
+                 loss_function: str = "mse",
+                 loss_weights: str = "1.0-1.0",
+                 loss_threshold: float = 0.0,
+                 round_targets: bool = False,
+                 data_size: int = 1,
+                 num_batches: int = 0,
+                 data_generation: str = "random",
+                 data_trace_file: str = "./input/dist_emb_j.log",
+                 data_set: str = "kaggle",
+                 raw_data_file: str = "",
+                 processed_data_file: str = "",
+                 data_randomize: str = "total",
+                 data_trace_enable_padding: bool = False,
+                 max_ind_range: int = -1,
+                 data_sub_saple_rate: float = 0.0,
+                 num_indices_per_lookup: int = 10,
+                 num_indices_per_lookup_fixed: bool = False,
+                 num_workers: int = 0,
+                 memory_map: bool = False,
+                 mini_batch_size: int = 1,
+                 nepochs: int = 1,
+                 learning_rate: float = 0.01,
+                 print_precision: int = 5,
+                 numpy_rand_seed: int = 123,
+                 sync_dense_params: bool = True,
+                 inference_only: bool = False,
+                 save_onnx: bool = False,
+                 use_gpu: bool = False,
+                 print_freq: int = 1,
+                 test_freq: int = -1,
+                 test_mini_batch_size: int = -1,
+                 test_num_workers: int = -1,
+                 print_time: bool = False,
+                 debug_mode: bool = False,
+                 enable_profiling: bool = False,
+                 plot_compute_graph: bool = False,
+                 save_model: str = "",
+                 load_model: str = "",
+                 mlperf_logging: bool = False,
+                 mlperf_acc_threshold: float = 0.0,
+                 mlperf_auc_threshold: float = 0.0,
+                 mlperf_bin_loader: bool = False,
+                 mlperf_bin_shuffle: bool = False,
+                 lr_num_warmup_steps: int = 0,
+                 lr_decay_start_step: int = 0,
+                 lr_num_decay_steps: int = 0,
+                 optimizer: int = 0):
+
+        self.dist_backend = dist_backend
+        self.backend_url = backend_url
+        self.sparse_dense_boundary = sparse_dense_boundary
+        self.bf16 = bf16
+        self.use_ipex = use_ipex
+
+        self.arch_dense_feature_size: int = arch_dense_feature_size
+        self.arch_sparse_feature_size: int = arch_sparse_feature_size
+        self.arch_embedding_size: str = arch_embedding_size
+        self.arch_mlp_bot: str = arch_mlp_bot
+        self.arch_mlp_top: str = arch_mlp_top
+        self.arch_interaction_op: str = arch_interaction_op
+        self.arch_interaction_itself: bool = arch_interaction_itself
+        self.md_flag: False = md_flag
+        self.md_threshold: int =md_threshold
+        self.md_temperature: float = md_temperature
+        self.md_round_dims: bool = md_round_dims
+        self.qr_flag: bool = qr_flag
+        self.qr_threshold: int = qr_threshold
+        self.qr_operation: str = qr_operation
+        self.qr_collisions: int = qr_collisions
+        self.activation_function: str = activation_function
+        self.loss_function: str = loss_function
+        self.loss_weights: str = loss_weights
+        self.loss_threshold: float = loss_threshold
+        self.round_targets: bool = round_targets
+        self.data_size: int = data_size
+        self.num_batches: int = num_batches
+        self.data_generation: str = data_generation
+        self.data_trace_file: str = data_trace_file
+        self.data_set: str = data_set
+        self.raw_data_file: str = raw_data_file
+        self.processed_data_file: str = processed_data_file
+        self.data_randomize: str = data_randomize
+        self.data_trace_enable_padding: bool = data_trace_enable_padding
+        self.max_ind_range: int = max_ind_range
+        self.data_sub_saple_rate: float = data_sub_saple_rate
+        self.num_indices_per_lookup: int = num_indices_per_lookup
+        self.num_indices_per_lookup_fixed: bool = num_indices_per_lookup_fixed
+        self.num_workers: int =num_workers
+        self.memory_map: bool = memory_map
+        self.mini_batch_size: int = mini_batch_size
+        self.nepochs: int = nepochs
+        self.learning_rate: float = learning_rate
+        self.print_precision: int = print_precision
+        self.numpy_rand_seed: int = numpy_rand_seed
+        self.sync_dense_params: bool = sync_dense_params
+        self.inference_only: bool = inference_only
+        self.save_onnx: bool = save_onnx
+        self.use_gpu: bool = use_gpu
+        self.print_freq: int = print_freq
+        self.test_freq: int = test_freq
+        self.test_mini_batch_size: int = test_mini_batch_size
+        self.test_num_workers: int = test_num_workers
+        self.print_time: bool = print_time
+        self.debug_mode: bool = debug_mode
+        self.enable_profiling: bool = enable_profiling
+        self.plot_compute_graph: bool = plot_compute_graph
+        self.save_model: str = save_model
+        self.load_model: str = load_model
+        self.mlperf_logging: bool = mlperf_logging
+        self.mlperf_acc_threshold: float = mlperf_acc_threshold
+        self.mlperf_auc_threshold: float = mlperf_auc_threshold
+        self.mlperf_bin_loader: bool = mlperf_bin_loader
+        self.mlperf_bin_shuffle: bool = mlperf_bin_shuffle
+        self.lr_num_warmup_steps: int = lr_num_warmup_steps
+        self.lr_decay_start_step: int = lr_decay_start_step
+        self.lr_num_decay_steps: int = lr_num_decay_steps
+        self.optimizer = optimizer
+
+
+def model_training(args: ModelArguments,
+                   train_ld,
+                   test_ld,
+                   model_size,
+                   nbatches=-1,
+                   nbatches_test=-1):
+
     # the reference implementation doesn't clear the cache currently
     # but the submissions are required to do that
     mlperf_logger.log_event(key=mlperf_logger.constants.CACHE_CLEAR, value=True)
 
     mlperf_logger.log_start(key=mlperf_logger.constants.INIT_START, log_all_ranks=True)
-
-    ### import packages ###
-    import sys
-    import os
-    import argparse
-
-    ### parse arguments ###
-    parser = argparse.ArgumentParser(
-        description="Train Deep Learning Recommendation Model (DLRM)"
-    )
-    # model related parameters
-    parser.add_argument("--arch-sparse-feature-size", type=int, default=2)
-    parser.add_argument("--arch-embedding-size", type=str, default="4-3-2")
-    # j will be replaced with the table number
-    parser.add_argument("--arch-mlp-bot", type=str, default="4-3-2")
-    parser.add_argument("--arch-mlp-top", type=str, default="4-2-1")
-    parser.add_argument("--arch-interaction-op", type=str, default="dot")
-    parser.add_argument("--arch-interaction-itself", action="store_true", default=False)
-    # embedding table options
-    parser.add_argument("--md-flag", action="store_true", default=False)
-    parser.add_argument("--md-threshold", type=int, default=200)
-    parser.add_argument("--md-temperature", type=float, default=0.3)
-    parser.add_argument("--md-round-dims", action="store_true", default=False)
-    parser.add_argument("--qr-flag", action="store_true", default=False)
-    parser.add_argument("--qr-threshold", type=int, default=200)
-    parser.add_argument("--qr-operation", type=str, default="mult")
-    parser.add_argument("--qr-collisions", type=int, default=4)
-    # activations and loss
-    parser.add_argument("--activation-function", type=str, default="relu")
-    parser.add_argument("--loss-function", type=str, default="mse")  # or bce or wbce
-    parser.add_argument("--loss-weights", type=str, default="1.0-1.0")  # for wbce
-    parser.add_argument("--loss-threshold", type=float, default=0.0)  # 1.0e-7
-    parser.add_argument("--round-targets", type=bool, default=False)
-    # data
-    parser.add_argument("--data-size", type=int, default=1)
-    parser.add_argument("--num-batches", type=int, default=0)
-    parser.add_argument(
-        "--data-generation", type=str, default="random"
-    )  # synthetic or dataset
-    parser.add_argument("--data-trace-file", type=str, default="./input/dist_emb_j.log")
-    parser.add_argument("--data-set", type=str, default="kaggle")  # or terabyte
-    parser.add_argument("--raw-data-file", type=str, default="")
-    parser.add_argument("--processed-data-file", type=str, default="")
-    parser.add_argument("--data-randomize", type=str, default="total")  # or day or none
-    parser.add_argument("--data-trace-enable-padding", type=bool, default=False)
-    parser.add_argument("--max-ind-range", type=int, default=-1)
-    parser.add_argument("--data-sub-sample-rate", type=float, default=0.0)  # in [0, 1]
-    parser.add_argument("--num-indices-per-lookup", type=int, default=10)
-    parser.add_argument("--num-indices-per-lookup-fixed", type=bool, default=False)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--memory-map", action="store_true", default=False)
-    # training
-    parser.add_argument("--mini-batch-size", type=int, default=1)
-    parser.add_argument("--nepochs", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=0.01)
-    parser.add_argument("--print-precision", type=int, default=5)
-    parser.add_argument("--numpy-rand-seed", type=int, default=123)
-    parser.add_argument("--sync-dense-params", type=bool, default=True)
-    # inference
-    parser.add_argument("--inference-only", action="store_true", default=False)
-    # onnx
-    parser.add_argument("--save-onnx", action="store_true", default=False)
-    # gpu
-    parser.add_argument("--use-gpu", action="store_true", default=False)
-    # distributed run
-    parser.add_argument("--dist-backend", type=str, default="")
-    # debugging and profiling
-    parser.add_argument("--print-freq", type=int, default=1)
-    parser.add_argument("--test-freq", type=int, default=-1)
-    parser.add_argument("--test-mini-batch-size", type=int, default=-1)
-    parser.add_argument("--test-num-workers", type=int, default=-1)
-    parser.add_argument("--print-time", action="store_true", default=False)
-    parser.add_argument("--debug-mode", action="store_true", default=False)
-    parser.add_argument("--enable-profiling", action="store_true", default=False)
-    parser.add_argument("--plot-compute-graph", action="store_true", default=False)
-    parser.add_argument("--profiling-start-iter", type=int, default=50)
-    parser.add_argument("--profiling-num-iters", type=int, default=100)
-    # store/load model
-    parser.add_argument("--out-dir", type=str, default=".")
-    parser.add_argument("--save-model", type=str, default="")
-    parser.add_argument("--load-model", type=str, default="")
-    # mlperf logging (disables other output and stops early)
-    parser.add_argument("--mlperf-logging", action="store_true", default=False)
-    # stop at target accuracy Kaggle 0.789, Terabyte (sub-sampled=0.875) 0.8107
-    parser.add_argument("--mlperf-acc-threshold", type=float, default=0.0)
-    # stop at target AUC Terabyte (no subsampling) 0.8025
-    parser.add_argument("--mlperf-auc-threshold", type=float, default=0.0)
-    parser.add_argument("--mlperf-bin-loader", action='store_true', default=False)
-    parser.add_argument("--mlperf-bin-shuffle", action='store_true', default=False)
-    # LR policy
-    parser.add_argument("--lr-num-warmup-steps", type=int, default=0)
-    parser.add_argument("--lr-decay-start-step", type=int, default=0)
-    parser.add_argument("--lr-num-decay-steps", type=int, default=0)
-    # embedding table is sparse table only if sparse_dense_boundary >= 2048
-    parser.add_argument("--sparse-dense-boundary", type=int, default=2048)
-    # bf16 option
-    parser.add_argument("--bf16", action='store_true', default=False)
-    # ipex option
-    parser.add_argument("--use-ipex", action="store_true", default=False)
-    # lamb
-    parser.add_argument("--optimizer", type=int, default=0, help='optimizer:[0:sgd, 1:lamb/sgd, 2:adagrad, 3:sparseadam]')
-
-    args = parser.parse_args()
 
     ext_dist.init_distributed(backend=args.dist_backend)
 
@@ -800,7 +841,17 @@ if __name__ == "__main__":
     mlperf_logger.log_start(key=mlperf_logger.constants.RUN_START)
     mlperf_logger.barrier()
 
-    if (args.data_generation == "dataset"):
+    if train_ld is not None:
+        ### prepare data set
+        ln_emb = list(model_size.values())
+        # enforce maximum limit on number of vectors per embedding
+        if args.max_ind_range > 0:
+            ln_emb = np.array(list(map(
+                lambda x: x if x < args.max_ind_range else args.max_ind_range, ln_emb)))
+
+        m_den = args.arch_dense_feature_size
+        ln_bot[0] = m_den
+    elif (args.data_generation == "dataset"):
         train_data, train_ld, test_data, test_ld = \
             dp.make_criteo_data_and_loaders(args)
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
@@ -815,7 +866,6 @@ if __name__ == "__main__":
             )))
         m_den = train_data.m_den
         ln_bot[0] = m_den
-
     else:
         # input and target at random
         ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
@@ -1332,7 +1382,7 @@ if __name__ == "__main__":
                         "Finished {} it {}/{} of epoch {}, {:.2f} ms/it, ".format(
                             str_run_type, j + 1, nbatches, k, gT
                         )
-                        + "loss {:.6f}, accuracy {:3.3f} %".format(gL, gA * 100)
+                        + "loss {:.6f}, accuracy {:3.3f} %".format(gL, gA * 100), flush=True
                     )
                     # Uncomment the line below to print out the total time with overhead
                     # print("Accumulated time so far: {}" \
@@ -1342,8 +1392,7 @@ if __name__ == "__main__":
 
                 # testing
                 if should_test and not args.inference_only:
-                    break
-                    epoch_num_float = (j + 1) / len(train_ld) + k + 1
+                    epoch_num_float = -1  # (j + 1) / len(train_ld) + k + 1
                     mlperf_logger.barrier()
                     mlperf_logger.log_start(key=mlperf_logger.constants.EVAL_START,
                                             metadata={mlperf_logger.constants.EPOCH_NUM: epoch_num_float})
@@ -1499,15 +1548,15 @@ if __name__ == "__main__":
                             + " accuracy {:3.3f} %, best accuracy {:3.3f} %".format(
                                 validation_results['accuracy'] * 100,
                                 best_gA_test * 100
-                            )
-                        )
+                            ),
+                            flush=True)
                     else:
                         print(
                             "Testing at - {}/{} of epoch {},".format(j + 1, nbatches, 0)
                             + " loss {:.6f}, accuracy {:3.3f} %, best {:3.3f} %".format(
                                 gL_test, gA_test * 100, best_gA_test * 100
-                            )
-                        )
+                            ),
+                            flush=True)
                     mlperf_logger.barrier()
                     mlperf_logger.log_end(key=mlperf_logger.constants.EVAL_STOP,
                                           metadata={mlperf_logger.constants.EPOCH_NUM: epoch_num_float})
@@ -1521,7 +1570,7 @@ if __name__ == "__main__":
                         and (best_gA_test > args.mlperf_acc_threshold)):
                         print("MLPerf testing accuracy threshold "
                               + str(args.mlperf_acc_threshold)
-                              + " reached, stop training")
+                              + " reached, stop training", flush=True)
                         break
 
                     if (args.mlperf_logging
@@ -1529,10 +1578,10 @@ if __name__ == "__main__":
                         and (best_auc_test > args.mlperf_auc_threshold)):
                         print("MLPerf testing auc threshold "
                               + str(args.mlperf_auc_threshold)
-                              + " reached, stop training")
+                              + " reached, stop training", flush=True)
                         train_end = time.time()
                         total_time = train_end - train_start
-                        print(F"Total Time:{total_time}")
+                        print(F"Total Time:{total_time}", flush=True)
                         mlperf_logger.barrier()
                         mlperf_logger.log_end(key=mlperf_logger.constants.RUN_STOP,
                                               metadata={
@@ -1550,7 +1599,7 @@ if __name__ == "__main__":
             k += 1  # nepochs
     train_end = time.time()
     total_time = train_end - train_start
-    print(F"Total Time:{total_time}")
+    print(F"Total Time:{total_time}", flush=True)
     if args.enable_profiling:
         print(prof.key_averages().table(sort_by="cpu_time_total"))
 
