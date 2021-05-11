@@ -1326,7 +1326,7 @@ def model_training(args: ModelArguments,
                             str_run_type, j + 1, nbatches, k, gT
                         )
                         + "loss {:.6f}, accuracy {:3.3f} %".format(gL, gA * 100)
-                    )
+                    , flush=True)
                     # Uncomment the line below to print out the total time with overhead
                     # print("Accumulated time so far: {}" \
                     # .format(time_wrap(use_gpu) - accum_time_begin))
@@ -1335,7 +1335,7 @@ def model_training(args: ModelArguments,
 
                 # testing
                 if should_test and not args.inference_only:
-                    epoch_num_float = (j + 1) / len(train_ld) + k + 1
+                    epoch_num_float = -1 #(j + 1) / len(train_ld) + k + 1
                     mlperf_logger.barrier()
                     mlperf_logger.log_start(key=mlperf_logger.constants.EVAL_START,
                                             metadata={mlperf_logger.constants.EPOCH_NUM: epoch_num_float})
@@ -1365,6 +1365,7 @@ def model_training(args: ModelArguments,
                             X_test, lS_o_test, lS_i_test, use_gpu, use_ipex, device
                         )
                         if args.mlperf_logging:
+                            print("start all gather", Z_test.shape, T_test.shape, flush=True)
                             if ext_dist.my_size > 1:
                                 Z_test = ext_dist.all_gather(Z_test, None)
                                 T_test = ext_dist.all_gather(T_test, None)
@@ -1492,7 +1493,7 @@ def model_training(args: ModelArguments,
                                 validation_results['accuracy'] * 100,
                                 best_gA_test * 100
                             )
-                        )
+                        , flush=True)
                     else:
                         print(
                             "Testing at - {}/{} of epoch {},".format(j + 1, nbatches, 0)
@@ -1513,7 +1514,7 @@ def model_training(args: ModelArguments,
                         and (best_gA_test > args.mlperf_acc_threshold)):
                         print("MLPerf testing accuracy threshold "
                               + str(args.mlperf_acc_threshold)
-                              + " reached, stop training")
+                              + " reached, stop training", flush=True)
                         break
 
                     if (args.mlperf_logging
@@ -1521,7 +1522,7 @@ def model_training(args: ModelArguments,
                         and (best_auc_test > args.mlperf_auc_threshold)):
                         print("MLPerf testing auc threshold "
                               + str(args.mlperf_auc_threshold)
-                              + " reached, stop training")
+                              + " reached, stop training", flush=True)
                         mlperf_logger.barrier()
                         mlperf_logger.log_end(key=mlperf_logger.constants.RUN_STOP,
                                               metadata={

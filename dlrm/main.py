@@ -1,4 +1,5 @@
 import functools
+import time
 from typing import List
 
 import pandas as pd
@@ -6,15 +7,13 @@ import ray
 import ray.util.data as ml_data
 import ray.util.iter as parallel_it
 import raydp
-from raydp.spark.dataset import RayMLDataset
-import time
 import torch
 from pyspark.sql.dataframe import DataFrame
 from raydp.spark.dataset import _save_spark_df_to_object_store
 from torch.utils.data.dataset import IterableDataset
 
 from .dlrm_s_pytorch import ModelArguments
-from .preproc.spark_preproc import pre_process, PreProcArguments
+from .preproc.spark_preproc import transform, generate_models, PreProcArguments
 
 columns = [f"_c{i}" for i in range(40)]
 
@@ -24,7 +23,7 @@ def collate_fn(
         num_numerical_features: int,
         max_ind_range: int,
         flag_input_torch_tensor=False):
-    #df = df[columns]
+    df = df[columns]
     # array = df.values
     # x_int_batch = array[:, 1:1 + num_numerical_features].astype(dtype=np.float32)
     # x_cat_batch = array[:, 1 + num_numerical_features:].astype(dtype=np.int64)
@@ -124,14 +123,13 @@ class TorchDataset(IterableDataset):
             yield self.collate_fn(return_df)
 
 
-def data_preprocess(
-        app_name: str,
+def preprocess_generate_models(
+        app_name: str = None,
         num_executors: int = None,
         executor_cores: int = None,
         executor_memory: str = None,
         configs=None,
-        args: PreProcArguments = None,
-        return_df: bool = True):
+        args: PreProcArguments = None):
     try:
         spark = raydp.init_spark(
             app_name=app_name,
@@ -140,8 +138,36 @@ def data_preprocess(
             executor_memory=executor_memory,
             configs=configs)
 
-        train_data, test_data, model_size = pre_process(spark, args, return_df)
-        return train_data, test_data, model_size
+        generate_models(spark, args, args.total_days_range)
+    except:
+        raise
+    finally:
+        raydp.stop_spark()
+
+
+def preprocess_transform(
+        app_name: str = None,
+        num_executors: int = None,
+        executor_cores: int = None,
+        executor_memory: str = None,
+        configs=None,
+        args: PreProcArguments = None,
+        return_df: bool = False):
+    try:
+        spark = raydp.init_spark(
+            app_name=app_name,
+            num_executors=num_executors,
+            executor_cores=executor_cores,
+            executor_memory=executor_memory,
+            configs=configs)
+        # transform for train data
+        train_data, model_size = transform(spark, args, args.train_days_range, True, return_df)
+
+        # transform for test data
+        args.low_mem = False
+        test_data, val_data, _ = transform(spark, args, args.test_days_range, False, return_df)
+
+        return train_data, test_data, val_data, model_size
     except:
         raise
     finally:
@@ -198,9 +224,9 @@ def create_train_task(
         test_loader = None
         if test_ds is not None:
             test_dataset = create_torch_ds(test_ds, num_workers, context.world_rank,
-                args.mini_batch_size, False, fn)
+                args.test_mini_batch_size, False, fn)
             test_loader = torch.utils.data.DataLoader(
-                test_ds,
+                test_dataset,
                 batch_size=None,
                 batch_sampler=None,
                 shuffle=False,
@@ -211,7 +237,12 @@ def create_train_task(
                 sampler=None
             )
         from dlrm.dlrm_s_pytorch import model_training
-        model_training(args, train_loader, test_loader, model_size,
-            nbatches, nbatches_test)
-        return context.world_rank
+        try:
+            model_training(args, train_loader, test_loader, model_size,
+                nbatches, nbatches_test)
+        except Exception as e:
+            time.sleep(1)
+            print(e, flush=True)
+        finally:
+            return context.world_rank
     return task_fn
