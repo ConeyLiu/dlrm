@@ -83,7 +83,6 @@ from torch.nn.parallel.scatter_gather import gather, scatter
 
 # For distributed run
 
-from dlrm.lamb import log_lamb_rs, Lamb
 import intel_pytorch_extension as ipex
 from intel_pytorch_extension import core
 
@@ -103,6 +102,7 @@ from torch.optim.lr_scheduler import _LRScheduler
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 device = None
 
+
 class LRPolicyScheduler(_LRScheduler):
     def __init__(self, optimizer, num_warmup_steps, decay_start_step, num_decay_steps):
         self.num_warmup_steps = num_warmup_steps
@@ -113,11 +113,7 @@ class LRPolicyScheduler(_LRScheduler):
         if self.decay_start_step < self.num_warmup_steps:
             sys.exit("Learning rate warmup must finish before the decay starts")
 
-        if isinstance(optimizer, tuple):
-            for opt in optimizer:
-                super(LRPolicyScheduler, self).__init__(opt)
-        else:
-            super(LRPolicyScheduler, self).__init__(optimizer)
+        super(LRPolicyScheduler, self).__init__(optimizer)
 
     def get_lr(self):
         step_count = self._step_count
@@ -253,16 +249,8 @@ class DLRM_Net(nn.Module):
                 ).astype(np.float32)
                 # approach 1
                 if n >= self.sparse_dense_boundary:
-                    #n = 39979771
-                    m_sparse = 16
-                    W = np.random.uniform(
-                        low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m_sparse)
-                    ).astype(np.float32)
-                    EE = nn.EmbeddingBag(n, m_sparse, mode="sum", sparse=True, _weight=torch.tensor(W, requires_grad=True))
+                    EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True, _weight=torch.tensor(W, requires_grad=True))
                 else:
-                    W = np.random.uniform(
-                        low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
-                    ).astype(np.float32)
                     EE = nn.EmbeddingBag(n, m, mode="sum", sparse=False, _weight=torch.tensor(W, requires_grad=True))
                 # approach 2
                 # EE.weight.data.copy_(torch.tensor(W))
@@ -400,7 +388,7 @@ class DLRM_Net(nn.Module):
 
         # print(ly)
         return ly
-#if self.bf16:
+
     def interact_features(self, x, ly):
         x = x.to(ly[0].dtype)
         if self.arch_interaction_op == "dot":
@@ -503,12 +491,7 @@ class DLRM_Net(nn.Module):
         # dense embeddings
         ly_dense = self.apply_emb(lS_o_dense, lS_i_dense, self.emb_dense)
         ly_sparse = a2a_req.wait()
-        ly_sparse2 = []
-        for i in range(len(ly_sparse)):
-            ly_sparse2.append(ly_sparse[i].repeat(1,4))
-        del ly_sparse
-        #ly_sparse ""= torch.cat(ly_sparse,1)
-        ly = ly_dense + list(ly_sparse2)
+        ly = ly_dense + list(ly_sparse)
         # interactions
         z = self.interact_features(x, ly)
         # top mlp
@@ -700,8 +683,7 @@ class ModelArguments:
                  mlperf_bin_shuffle: bool = False,
                  lr_num_warmup_steps: int = 0,
                  lr_decay_start_step: int = 0,
-                 lr_num_decay_steps: int = 0,
-                 optimizer: int = 0):
+                 lr_num_decay_steps: int = 0):
 
         self.dist_backend = dist_backend
         self.backend_url = backend_url
@@ -771,7 +753,6 @@ class ModelArguments:
         self.lr_num_warmup_steps: int = lr_num_warmup_steps
         self.lr_decay_start_step: int = lr_decay_start_step
         self.lr_num_decay_steps: int = lr_num_decay_steps
-        self.optimizer = optimizer
 
 
 def model_training(args: ModelArguments,
@@ -780,12 +761,15 @@ def model_training(args: ModelArguments,
                    model_size,
                    nbatches=-1,
                    nbatches_test=-1):
-
+    start_time = time.time()
     # the reference implementation doesn't clear the cache currently
     # but the submissions are required to do that
     mlperf_logger.log_event(key=mlperf_logger.constants.CACHE_CLEAR, value=True)
 
     mlperf_logger.log_start(key=mlperf_logger.constants.INIT_START, log_all_ranks=True)
+
+    ### import packages ###
+    import sys
 
     ext_dist.init_distributed(backend=args.dist_backend)
 
@@ -810,6 +794,7 @@ def model_training(args: ModelArguments,
 
     use_gpu = args.use_gpu and torch.cuda.is_available()
     use_ipex = args.use_ipex
+    global device
     if use_gpu:
         torch.cuda.manual_seed_all(args.numpy_rand_seed)
         torch.backends.cudnn.deterministic = True
@@ -840,7 +825,7 @@ def model_training(args: ModelArguments,
     mlperf_logger.barrier()
     mlperf_logger.log_start(key=mlperf_logger.constants.RUN_START)
     mlperf_logger.barrier()
-
+    
     if train_ld is not None:
         ### prepare data set
         ln_emb = list(model_size.values())
@@ -851,12 +836,16 @@ def model_training(args: ModelArguments,
 
         m_den = args.arch_dense_feature_size
         ln_bot[0] = m_den
+        if nbatches <= 0:
+            nbatches = len(train_ld)
+        if nbatches_test <= 0:
+            nbatches_test = len(test_ld)
     elif (args.data_generation == "dataset"):
         train_data, train_ld, test_data, test_ld = \
             dp.make_criteo_data_and_loaders(args)
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
         nbatches_test = len(test_ld)
-
+    
         ln_emb = train_data.counts
         # enforce maximum limit on number of vectors per embedding
         if args.max_ind_range > 0:
@@ -872,7 +861,7 @@ def model_training(args: ModelArguments,
         m_den = ln_bot[0]
         train_data, train_ld = dp.make_random_data_and_loader(args, ln_emb, m_den)
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
-
+        
     ### parse command line arguments ###
     m_spa = args.arch_sparse_feature_size
     num_fea = ln_emb.size + 1  # num sparse + num dense features
@@ -1026,7 +1015,7 @@ def model_training(args: ModelArguments,
         bf16 = args.bf16,
         use_ipex = args.use_ipex
     )
-    
+
     print('Model created!')
     # test prints
     if args.debug_mode:
@@ -1071,46 +1060,27 @@ def model_training(args: ModelArguments,
 
     if not args.inference_only:
         # specify the optimizer algorithm
-        optimizer_list = ([torch.optim.SGD, ([Lamb, False], torch.optim.SGD),
-                           torch.optim.Adagrad, ([torch.optim.Adam, None], torch.optim.SparseAdam)],
-                          [ipex.SplitSGD, ([Lamb, True], ipex.SplitSGD)])
-        optimizers = optimizer_list[args.bf16 and ipex.is_available()][args.optimizer]
-        print('Chosen optimizer(s): %s' % str(optimizers))
-
         if ext_dist.my_size == 1:
-            if len(optimizers) == 1:
-                optimizer = optimizers(dlrm.parameters(), lr=args.learning_rate)
+            if args.bf16 and ipex.is_available():
+                optimizer = ipex.SplitSGD(dlrm.parameters(), lr=args.learning_rate)
             else:
-                optimizer_dense = optimizers[0][0]([
-                    {"params": dlrm.bot_l.parameters(), "lr": args.learning_rate},
-                    {"params": dlrm.top_l.parameters(), "lr": args.learning_rate}
-                ], lr=args.learning_rate)
-                if optimizers[0][1] is not None:
-                    optimizer_dense.set_bf16(optimizers[0][1])
-                optimizer_sparse = optimizers[1]([
-                    {"params": [p for emb in dlrm.emb_l for p in emb.parameters()], "lr": args.learning_rate},
-                ], lr=args.learning_rate)
-                optimizer = (optimizer_dense, optimizer_sparse)
+                optimizer = torch.optim.SGD(dlrm.parameters(), lr=args.learning_rate)
         else:
-            if len(optimizers) == 1:
-                optimizer = optimizers([
-                    {"params": [p for emb in dlrm.emb_sparse for p in emb.parameters()],
-                     "lr": args.learning_rate / ext_dist.my_size},
-                    {"params": [p for emb in dlrm.emb_dense for p in emb.parameters()], "lr": args.learning_rate},
-                    {"params": dlrm.bot_l.parameters(), "lr": args.learning_rate},
-                    {"params": dlrm.top_l.parameters(), "lr": args.learning_rate}
+            if args.bf16 and ipex.is_available():
+                optimizer = ipex.SplitSGD([
+                    {"params": [p for emb in dlrm.emb_sparse for p in emb.parameters()], "lr" : args.learning_rate / ext_dist.my_size},
+                    {"params": [p for emb in dlrm.emb_dense for p in emb.parameters()], "lr" : args.learning_rate},
+                    {"params": dlrm.bot_l.parameters(), "lr" : args.learning_rate},
+                    {"params": dlrm.top_l.parameters(), "lr" : args.learning_rate}
                 ], lr=args.learning_rate)
             else:
-                optimizer_dense = optimizers[0][0]([
-                    {"params": [p for emb in dlrm.emb_dense for p in emb.parameters()], "lr": args.learning_rate},
-                    {"params": dlrm.bot_l.parameters(), "lr": args.learning_rate},
-                    {"params": dlrm.top_l.parameters(), "lr": args.learning_rate}
-                ], lr=args.learning_rate, bf16=args.bf16)
-                optimizer_sparse = optimizers[1]([
-                    {"params": [p for emb in dlrm.emb_sparse for p in emb.parameters()],
-                     "lr": args.learning_rate / ext_dist.my_size},
+                optimizer = torch.optim.SGD([
+                    {"params": [p for emb in dlrm.emb_sparse for p in emb.parameters()], "lr" : args.learning_rate / ext_dist.my_size},
+                    {"params": [p for emb in dlrm.emb_dense for p in emb.parameters()], "lr" : args.learning_rate},
+                    {"params": dlrm.bot_l.parameters(), "lr" : args.learning_rate},
+                    {"params": dlrm.top_l.parameters(), "lr" : args.learning_rate}
                 ], lr=args.learning_rate)
-                optimizer = (optimizer_dense, optimizer_sparse)
+
         lr_scheduler = LRPolicyScheduler(optimizer, args.lr_num_warmup_steps, args.lr_decay_start_step,
                                       args.lr_num_decay_steps)
 
@@ -1244,18 +1214,6 @@ def model_training(args: ModelArguments,
     mlperf_logger.log_event(key='sgd_opt_learning_rate_decay_steps', value=args.lr_num_decay_steps)
     mlperf_logger.log_event(key='sgd_opt_learning_rate_decay_poly_power', value=2)
 
-    # record_shapes=True
-    # if hasattr(torch.autograd.profiler.profile, "resume"):
-    #     prof_support_suspend_resume = True
-    #     prof_arg_dict = {"start_suspended": True}
-    # else:
-    #     prof_support_suspend_resume = False
-    #     prof_arg_dict = { }
-
-    # prof_start_iter = args.profiling_start_iter
-    # prof_end_iter = prof_start_iter + args.profiling_num_iters
-    train_start = time.time()
-    # with torch.autograd.profiler.profile(args.enable_profiling, use_gpu, record_shapes=record_shapes, **prof_arg_dict) as prof:
     with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
         while k < args.nepochs:
             mlperf_logger.barrier()
@@ -1288,11 +1246,8 @@ def model_training(args: ModelArguments,
                     else:
                         iteration_time = 0
                     previous_iteration_time = current_time
-                    # if prof and prof_support_suspend_resume and j == prof_start_iter: prof.resume()
-                    # if prof and prof_support_suspend_resume and j == prof_end_iter: prof.suspend()
                 else:
-                    # ext_dist.barrier()
-                    # if prof and prof_support_suspend_resume and j >= prof_start_iter and j < prof_end_iter: prof.resume()
+                    ext_dist.barrier()
                     t1 = time_wrap(use_gpu)
 
                 # early exit if nbatches was set by the user and has been exceeded
@@ -1319,6 +1274,7 @@ def model_training(args: ModelArguments,
                 print(Z.detach().cpu().numpy())
                 print(E.detach().cpu().numpy())
                 '''
+                #print(E.detach().cpu().numpy(), flush=True)
                 # compute loss and accuracy
                 L = E.detach().cpu().numpy()  # numpy array
                 S = Z.detach().cpu().numpy()  # numpy array
@@ -1329,11 +1285,7 @@ def model_training(args: ModelArguments,
                 if not args.inference_only:
                     # scaled error gradient propagation
                     # (where we do not accumulate gradients across mini-batches)
-                    if args.optimizer == 1 or args.optimizer == 3:
-                        optimizer_dense.zero_grad()
-                        optimizer_sparse.zero_grad()
-                    else:
-                        optimizer.zero_grad()
+                    optimizer.zero_grad()
                     # backward pass
                     E.backward()
                     # debug prints (check gradient norm)
@@ -1342,11 +1294,7 @@ def model_training(args: ModelArguments,
                     #          print(l.weight.grad.norm().item())
 
                     # optimizer
-                    if args.optimizer == 1 or args.optimizer == 3:
-                        optimizer_dense.step()
-                        optimizer_sparse.step()
-                    else:
-                        optimizer.step()
+                    optimizer.step()
                     lr_scheduler.step()
 
                 if args.mlperf_logging:
@@ -1382,8 +1330,8 @@ def model_training(args: ModelArguments,
                         "Finished {} it {}/{} of epoch {}, {:.2f} ms/it, ".format(
                             str_run_type, j + 1, nbatches, k, gT
                         )
-                        + "loss {:.6f}, accuracy {:3.3f} %".format(gL, gA * 100), flush=True
-                    )
+                        + "loss {:.6f}, accuracy {:3.3f} %".format(gL, gA * 100)
+                    , flush=True)
                     # Uncomment the line below to print out the total time with overhead
                     # print("Accumulated time so far: {}" \
                     # .format(time_wrap(use_gpu) - accum_time_begin))
@@ -1392,7 +1340,7 @@ def model_training(args: ModelArguments,
 
                 # testing
                 if should_test and not args.inference_only:
-                    epoch_num_float = -1  # (j + 1) / len(train_ld) + k + 1
+                    epoch_num_float = -1 #(j + 1) / len(train_ld) + k + 1
                     mlperf_logger.barrier()
                     mlperf_logger.log_start(key=mlperf_logger.constants.EVAL_START,
                                             metadata={mlperf_logger.constants.EPOCH_NUM: epoch_num_float})
@@ -1548,15 +1496,15 @@ def model_training(args: ModelArguments,
                             + " accuracy {:3.3f} %, best accuracy {:3.3f} %".format(
                                 validation_results['accuracy'] * 100,
                                 best_gA_test * 100
-                            ),
-                            flush=True)
+                            )
+                        , flush=True)
                     else:
                         print(
                             "Testing at - {}/{} of epoch {},".format(j + 1, nbatches, 0)
                             + " loss {:.6f}, accuracy {:3.3f} %, best {:3.3f} %".format(
                                 gL_test, gA_test * 100, best_gA_test * 100
-                            ),
-                            flush=True)
+                            )
+                        )
                     mlperf_logger.barrier()
                     mlperf_logger.log_end(key=mlperf_logger.constants.EVAL_STOP,
                                           metadata={mlperf_logger.constants.EPOCH_NUM: epoch_num_float})
@@ -1579,16 +1527,11 @@ def model_training(args: ModelArguments,
                         print("MLPerf testing auc threshold "
                               + str(args.mlperf_auc_threshold)
                               + " reached, stop training", flush=True)
-                        train_end = time.time()
-                        total_time = train_end - train_start
-                        print(F"Total Time:{total_time}", flush=True)
                         mlperf_logger.barrier()
                         mlperf_logger.log_end(key=mlperf_logger.constants.RUN_STOP,
                                               metadata={
                                                   mlperf_logger.constants.STATUS: mlperf_logger.constants.SUCCESS})
-                                
                         break
-                    #ext_dist.barrier()
 
             mlperf_logger.barrier()
             mlperf_logger.log_end(key=mlperf_logger.constants.EPOCH_STOP,
@@ -1597,11 +1540,8 @@ def model_training(args: ModelArguments,
             mlperf_logger.log_end(key=mlperf_logger.constants.BLOCK_STOP,
                                   metadata={mlperf_logger.constants.FIRST_EPOCH_NUM: k + 1})
             k += 1  # nepochs
-    train_end = time.time()
-    total_time = train_end - train_start
-    print(F"Total Time:{total_time}", flush=True)
-    if args.enable_profiling:
-        print(prof.key_averages().table(sort_by="cpu_time_total"))
+
+    print("Duration: ", time.time() - start_time, flush=True)
 
     if args.mlperf_logging and best_auc_test <= args.mlperf_auc_threshold:
         mlperf_logger.barrier()

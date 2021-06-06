@@ -521,6 +521,6 @@ def transform(spark, args: PreProcArguments, day_range, is_train: bool, return_d
         else:
             df.write.parquet(
                 output_folder,
-                model=args.write_mode,
+                mode=args.write_mode,
                 partitionBy=partitionBy)
             return output_folder, model_size

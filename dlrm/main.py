@@ -1,18 +1,23 @@
 import functools
+import queue
+import threading
 import time
 from typing import List
 
 import pandas as pd
-import ray
 import ray.util.data as ml_data
-import ray.util.iter as parallel_it
 import raydp
 import torch
-from pyspark.sql.dataframe import DataFrame
-from raydp.spark.dataset import _save_spark_df_to_object_store
+
+from raydp.torch import create_data_loader
 from torch.utils.data.dataset import IterableDataset
 
-from .dlrm_s_pytorch import ModelArguments
+import os
+
+if "use_dlrm_optimized" in os.environ:
+    from .dlrm_s_pytorch_optimized import ModelArguments
+else:
+    from .dlrm_s_pytorch_original import ModelArguments
 from .preproc.spark_preproc import transform, generate_models, PreProcArguments
 
 columns = [f"_c{i}" for i in range(40)]
@@ -55,97 +60,7 @@ def collate_fn(
     return x_int_batch, lS_o, x_cat_batch.t(), y_batch.view(-1, 1)
 
 
-def create_torch_ds(ds: ml_data.MLDataset,
-                    num_shards: int,
-                    shard_index: int,
-                    batch_size: int,
-                    shuffle: bool,
-                    collate_fn):
-    assert shard_index < num_shards
-    shard_ids = []
-    i = shard_index
-    step = num_shards
-    while i < ds.num_shards():
-        shard_ids.append(i)
-        i += step
-    ds = ds.select_shards(shard_ids)
-    return TorchDataset(ds, batch_size // num_shards, shuffle, collate_fn)
-
-
-class TorchDataset(IterableDataset):
-    def __init__(self,
-                 ds: ml_data.MLDataset,
-                 batch_size: int,
-                 shuffle: bool,
-                 collate_fn):
-        self.ds = ds
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.collate_fn = collate_fn
-
-    def __iter__(self):
-        it = self.ds.gather_async(batch_ms=0, num_async=self.ds.num_shards())
-        it = iter(it)
-        return_df = None
-        while True:
-            try:
-                cur_df = next(it)
-                cur_index = 0
-                cur_size = cur_df.shape[0]
-                while cur_df is not None or (
-                        cur_index + self.batch_size) < cur_size:
-                    if cur_df is None or cur_index == cur_size:
-                        cur_df = next(it)
-                        cur_index = 0
-                        cur_size = cur_df.shape[0]
-                    if return_df is not None:
-                        ri = cur_index + self.batch_size - return_df.shape[0]
-                        ri = min(ri, cur_size)
-                        tmp = cur_df.iloc[cur_index:ri]
-                        return_df = pd.concat([return_df, tmp])
-                        cur_index = ri
-                    else:
-                        ri = cur_index + self.batch_size
-                        ri = min(ri, cur_size)
-                        return_df = cur_df.iloc[cur_index:ri]
-                        cur_index = ri
-                    if return_df.shape[0] == self.batch_size:
-                        if self.shuffle:
-                            return_df = return_df.sample(frac=1)
-                        yield self.collate_fn(return_df)
-                        return_df = None
-            except StopIteration:
-                break
-
-        if return_df is not None:
-            if self.shuffle:
-                return_df = return_df.sample(frac=1)
-            yield self.collate_fn(return_df)
-
-
-def preprocess_generate_models(
-        app_name: str = None,
-        num_executors: int = None,
-        executor_cores: int = None,
-        executor_memory: str = None,
-        configs=None,
-        args: PreProcArguments = None):
-    try:
-        spark = raydp.init_spark(
-            app_name=app_name,
-            num_executors=num_executors,
-            executor_cores=executor_cores,
-            executor_memory=executor_memory,
-            configs=configs)
-
-        generate_models(spark, args, args.total_days_range)
-    except:
-        raise
-    finally:
-        raydp.stop_spark()
-
-
-def preprocess_transform(
+def data_preprocess(
         app_name: str = None,
         num_executors: int = None,
         executor_cores: int = None,
@@ -154,39 +69,33 @@ def preprocess_transform(
         args: PreProcArguments = None,
         return_df: bool = False):
     try:
+        start = time.time()
         spark = raydp.init_spark(
             app_name=app_name,
             num_executors=num_executors,
             executor_cores=executor_cores,
             executor_memory=executor_memory,
             configs=configs)
+
+        # generate models
+        generate_models(spark, args, args.total_days_range)
+        args.low_mem = False
+
         # transform for train data
         train_data, model_size = transform(spark, args, args.train_days_range, True, return_df)
 
         # transform for test data
-        args.low_mem = False
-        test_data, val_data, _ = transform(spark, args, args.test_days_range, False, return_df)
+        args.output_ordering = "input"
+        test_data, _ = transform(spark, args, args.test_days_range, False, return_df)
 
-        return train_data, test_data, val_data, model_size
+        print("Data preprocessing duration:", time.time() - start)
+
+        return train_data, test_data, model_size
     except:
         raise
     finally:
         if not return_df:
             raydp.stop_spark()
-
-
-def create_ml_dataset_from_spark(df: DataFrame,
-                                 num_workers: int,
-                                 actors: List[ray.actor.ActorHandle]):
-    start = time.time()
-    assert num_workers == len(actors)
-    df = df.repartition(num_workers)
-    record_batch_set = _save_spark_df_to_object_store(df, num_workers, True)
-    ray.get([actor.init.remote(batch, False) for actor, batch in zip(actors, record_batch_set)])
-    it = parallel_it.from_actors(actors, "DataFrame MLDataset")
-    ds = ml_data.from_parallel_iter(it, need_convert=False, batch_size=0, repeated=False)
-    print(f"Duration: {time.time() - start}")
-    return ds
 
 
 def create_train_task(
@@ -206,37 +115,16 @@ def create_train_task(
     def task_fn(context):
         train_loader = None
         if train_ds is not None:
-            train_dataset = create_torch_ds(train_ds, num_workers, context.world_rank,
-                args.mini_batch_size, args.mlperf_bin_shuffle, fn)
-        
-            train_loader = torch.utils.data.DataLoader(
-                train_dataset,
-                batch_size=None,
-                batch_sampler=None,
-                shuffle=False,
-                num_workers=0,
-                collate_fn=None,
-                pin_memory=False,
-                drop_last=False,
-                sampler=None
-        )
+            batch_size = args.mini_batch_size // num_workers
+            train_loader = create_data_loader(train_ds, num_workers, context.world_rank,
+                context.local_rank, batch_size, fn, True, int(time.time()), context.node_ip, True)
 
         test_loader = None
         if test_ds is not None:
-            test_dataset = create_torch_ds(test_ds, num_workers, context.world_rank,
-                args.test_mini_batch_size, False, fn)
-            test_loader = torch.utils.data.DataLoader(
-                test_dataset,
-                batch_size=None,
-                batch_sampler=None,
-                shuffle=False,
-                num_workers=0,
-                collate_fn=None,
-                pin_memory=False,
-                drop_last=False,
-                sampler=None
-            )
-        from dlrm.dlrm_s_pytorch import model_training
+            test_batch_size = args.test_mini_batch_size // num_workers
+            test_loader = create_data_loader(test_ds, num_workers, context.world_rank,
+                context.local_rank, test_batch_size, fn, False, None, context.node_ip, True)
+        from dlrm.dlrm_s_pytorch_original import model_training
         try:
             model_training(args, train_loader, test_loader, model_size,
                 nbatches, nbatches_test)
