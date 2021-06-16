@@ -837,9 +837,9 @@ def model_training(args: ModelArguments,
         m_den = args.arch_dense_feature_size
         ln_bot[0] = m_den
         if nbatches <= 0:
-            nbatches = len(train_ld)
+            nbatches = len(train_ld) // (args.mini_batch_size // ext_dist.my_size)
         if nbatches_test <= 0:
-            nbatches_test = len(test_ld)
+            nbatches_test = len(test_ld) // (args.test_mini_batch_size // ext_dist.my_size)
     elif (args.data_generation == "dataset"):
         train_data, train_ld, test_data, test_ld = \
             dp.make_criteo_data_and_loaders(args)

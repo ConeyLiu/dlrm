@@ -8,10 +8,11 @@ data_preprocess:
   output_folder: "hdfs://sr133:9000/dlrm/output/"
   model_size_file: True
   model_folder: "hdfs://sr133:9000/dlrm/model/"
-  write_mode: overwrite
-  dict_build_shuffle_parallel_per_day: 2
-  low_mem: False
   frequency_limit: 15
+  write_mode: overwrite
+  low_mem: True
+  output_ordering: input
+  dict_build_shuffle_parallel_per_day: 2
   spark_config:
     app_name: "dlrm"
     num_executors: 8
@@ -20,14 +21,14 @@ data_preprocess:
     configs:
       spark.local.dir: "/mnt/DP_disk1/xianyang/spark,/mnt/DP_disk2/xianyang/spark,/mnt/DP_disk3/xianyang/spark,/mnt/DP_disk4/xianyang/spark"
       spark.network.timeout: 1800s
-      spark.driver.memory: 100GB
+      spark.driver.memory: 100g
       spark.sql.files.maxPartitionBytes: 1073741824
       spark.driver.maxResultSize: 10G
-      spark.locality.wait: 1s
+      spark.locality.wait: 0s
       spark.sql.autoBroadcastJoinThreshold: 500M
       spark.sql.broadcastTimeout: 1800s
       spark.sql.shuffle.partitions: 600
-      spark.executor.extraJavaOptions: "-XX:+UseParallelGC -XX:+UseParallelOldGC -XX:+UseAdaptiveSizePolicy"
+      spark.executor.extraJavaOptions: "-XX:+UseG1GC -XX:MaxGCPauseMillis=1000 -XX:+UseStringDeduplication -XX:+ParallelRefProcEnabled"
 
 mpi_config:
   env:

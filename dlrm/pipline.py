@@ -164,35 +164,37 @@ def run(config_path: str):
                                      write_mode=data_config["write_mode"],
                                      dict_build_shuffle_parallel_per_day=data_config["dict_build_shuffle_parallel_per_day"],
                                      low_mem=data_config["low_mem"],
-                                     frequency_limit=str(data_config["frequency_limit"]))
+                                     frequency_limit=str(data_config["frequency_limit"]),
+                                     output_ordering=data_config["output_ordering"])
 
     start = time.time()
-    train_data, test_data, model_size = data_preprocess(app_name=data_config["app_name"],
-                                                        num_executors=data_config["num_executors"],
-                                                        executor_cores=data_config["executor_cores"],
-                                                        executor_memory=data_config["executor_memory"],
-                                                        configs=data_config["spark_config"]["configs"],
+    spark_config = data_config["spark_config"]
+    train_data, test_data, model_size = data_preprocess(app_name=spark_config["app_name"],
+                                                        num_executors=spark_config["num_executors"],
+                                                        executor_cores=spark_config["executor_cores"],
+                                                        executor_memory=spark_config["executor_memory"],
+                                                        configs=spark_config["configs"],
                                                         args=pre_proc_args,
                                                         return_df=False)
     model_size = OrderedDict([(key, value + 1) for key, value in model_size.items()])
     print("Data dreprocess duration: ", time.time() - start)
     start = time.time()
 
+    # ditributed model training
     mpi_config = config["mpi_config"]
-    mpi_env = config["env"]
+    mpi_env = mpi_config["env"]
 
     def mpi_script_prepare_fn(context: MPIJobContext):
-        extra_env = {}
-        extra_env["http_proxy"] = ""
-        extra_env["https_proxy"] = ""
+        context.add_env("http_proxy", "")
+        context.add_env("https_proxy", "")
 
         for k in mpi_env:
-            extra_env[k] = str(mpi_env[k])
+            context.add_env(k, str(mpi_env[k]))
 
         scripts = []
         scripts.append("mpiexec.hydra")
         scripts.append("-genv")
-        scripts.append(str(mpi_config["I_MPI_PIN_DOMAIN"]))
+        scripts.append(f"I_MPI_PIN_DOMAIN={mpi_config['I_MPI_PIN_DOMAIN']}")
         scripts.append("-hosts")
         scripts.append(",".join(context.hosts))
         scripts.append("-ppn")
@@ -207,6 +209,7 @@ def run(config_path: str):
                          mpi_script_prepare_fn=mpi_script_prepare_fn,
                          timeout=mpi_config["timeout"],
                          mpi_type=mpi_config["mpi_type"])
+    job.start()
 
     addresses = job.get_rank_addresses()
 

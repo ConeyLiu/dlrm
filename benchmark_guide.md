@@ -10,8 +10,14 @@ dlrm: python setup.py bdist_wheel && pip install dist/dlrm-*.whl
 We use the mlperf code by default, you should set env: `use_dlrm_optimized=True` before import dlrm if you want to use the optimized code from Jian's team.
 
 ```python
-
+import os
 import dlrm
+import ray
+
+os.environ["HADOOP_CONF_DIR"] = "/home/xianyang/sw/hadoop-2.7.7/etc/hadoop"
+# os.environp["use_dlrm_optimized"] = "True"
+
+ray.init(...)
 
 dlrm.run("config file path")
 ```
